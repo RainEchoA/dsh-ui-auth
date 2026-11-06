@@ -7,16 +7,15 @@
 [![npm downloads](https://img.shields.io/npm/dm/dsh-ui-auth.svg)](https://www.npmjs.com/package/dsh-ui-auth)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/0QwQ0/dsh-ui-auth)
 
-## 🔴 兼容性提示：legacy 版本（DSH 0.1.1-rc.2）的支持已于 v0.7.0 结束
+## 🔴 兼容性提示：只守护当前 DSH 版本线
 
-![legacy support ended in v0.7.0](https://img.shields.io/badge/legacy%20support-ended%20in%20v0.7.0-red)
+v0.7.0 起本插件**只跟随 DSH 的新版本开发**，目标版本 `0.2.0-rc.2`（web profile）。
+**历史版本（DSH 0.1.x 全系）不再提供兼容保证，也不在测试矩阵的守护范围内**：
+legacy 传输线（dotted `/api/<a>.<b>` + `apiProxy`）的代码已**完全移除**。
 
-v0.7.0 起本插件**只跟随 DSH 的新版本开发**（目标版本 `0.2.0-rc.2`），
-legacy 传输线（dotted `/api/<a>.<b>` + `apiProxy`）的代码已**完全移除**：
 宿主未提供现代传输能力时插件会 **fail-closed**（认证网关不建立、面板不可访问并输出明确错误），
-**不会**退回旧传输线，更不会降级成无门放行。
-若 DSH 后续架构有大变动，我会**提前声明**该版本的支持结束时间，不会突然中断。
-仍在使用 0.1.1-rc.2 的部署请在此之前按 [DSH 版本兼容性](#dsh-版本兼容性) 一节规划升级。
+**不会**退回旧传输线，更不会降级成无门放行。升级前请确认 DSH 版本，详见
+[DSH 版本兼容性](#dsh-版本兼容性)。
 
 给 DeepSeek Harness（DSH）的 Web UI 加一道**用户名 / 密码登录门**：未登录时无法访问任何页面、
 API 或 WebSocket 通道；登录后可管理用户、邀请码、两步验证（TOTP）与**通行密钥（Passkey）**，
@@ -73,7 +72,7 @@ API 或 WebSocket 通道；登录后可管理用户、邀请码、两步验证�
 
 | 项 | 要求 |
 |---|---|
-| DSH | **`>=0.2.0-rc.2 <0.3.0`**（web profile）。v0.7.0 起**只支持 0.2.0 线**——legacy 的 `0.1.1-rc.2` 传输线已移除，失去现代传输能力时插件 **fail-closed**（面板不可访问并打印明确错误），详见[兼容性矩阵](docs/DSH-0.2.0-COMPATIBILITY.md) |
+| DSH | **`>=0.2.0-rc.2 <0.3.0`**（web profile）。v0.7.0 起**只支持 0.2.0 线**，且**只为当前版本线提供兼容保证**：`0.1.x` 历史版本的传输线已移除、不在测试矩阵的守护范围内；失去现代传输能力时插件 **fail-closed**（面板不可访问并打印明确错误），详见[兼容性矩阵](docs/DSH-0.2.0-COMPATIBILITY.md) |
 | Node.js | `^22.19.0 || >=24.0.0`（与 DSH 一致） |
 | 运行时依赖 | `qrcode`（生成 TOTP 二维码）、`ws`（流式通道）与 `@simplewebauthn/server`（通行密钥服务端校验），安装时自动获取，无需手动构建 |
 | 浏览器 | 通行密钥需要 Chrome / Edge / Safari / Firefox 等支持 WebAuthn 的现代浏览器；不支持时其余功能不受影响 |
@@ -325,17 +324,17 @@ dsh plugin --profile web remove dsh-ui-auth
 
 ## DSH 版本兼容性
 
-v0.7.0 起**只支持 modern 传输线**（DSH `0.2.0-rc.2` 线），legacy 传输线已完全移除。
-下表按"目标版本 / 中间版本 / legacy"三档给出实测结论（表格随每次实测更新）：
+v0.7.0 起**只支持 modern 传输线**（DSH `0.2.0` 线），历史传输线已完全移除。
+**测试矩阵只守护新版本 DSH**：下面的表只覆盖当前版本线，`0.1.x` 历史版本不在守护范围内
+（其历史实测记录保留在 [docs/DSH-0.2.0-COMPATIBILITY.md](docs/DSH-0.2.0-COMPATIBILITY.md)，仅供考古）：
 
 | 档位 | DSH 版本 | 结论 | 说明 |
 |---|---|---|---|
 | **目标** | `0.2.0-rc.2` | ✅ compatible | 唯一的目标版本；启动即硬前置校验，端点面与页面均按此版本实测 |
-| 中间 | 全部已实测：`0.2.0-rc.1`、`0.1.7-rc.2`、`0.1.7-rc.1`（✅ 38/38）；`0.1.6-alpha.2`（37/38）、`0.1.5-rc.3`、`0.1.5-rc.2`、`0.1.5-rc.1`（34/38，缺 0.2.0 独有端点，属能力收窄）；`0.1.6-alpha.1` ❌ 宿主自身无法启动（上游缺陷） | 见左 | 中间版本不会因为缺能力而放行：缺失现代传输能力即 fail-closed；端点缺失只表现为该页不可用（404） |
-| legacy | `0.1.1-rc.2` | ❌ **已移除** | 缺失 `connection.authorizeIndex` 时**fail-closed**：认证网关不建立、面板不可访问并输出明确错误，绝不降级为无门放行 |
+| 当前线 | `0.2.0-rc.1` | ✅ compatible | 38/38，与目标版本同结论 |
 
 **注意**：宿主未提供现代传输能力时，插件**不会**退回旧传输线，而是以"明确拒绝"的方式停摆
-（宁可不可访问，也不能无门暴露）。这也意味着升级到 v0.7.0 前请先确认 DSH 版本。
+（宁可不可访问，也不能无门暴露）。这也意味着升级前请先确认 DSH 版本在 `>=0.2.0-rc.2 <0.3.0` 之内。
 
 普通用户在 modern 线上的可达面同样按用户裁剪：模型与 API Key 各自独立（见
 [按用户隔离的模型与 API Key](docs/RBAC-MODEL-PROFILES.md)），不能创建 workspace（属部署方能力），
@@ -399,7 +398,7 @@ npm run verify:clean   # 校验 lib/ 与 src/ 一致（改源码后必须提交�
 |---|---|
 | `npm run store:check` | 商城契约门禁（依赖声明、权限信号、打包内容） |
 | `npm run test:compat:0.2.0` | 真实 DSH 0.2.0 实例端到端（38 项） |
-| `npm run test:compat:matrix` | 多版本兼容矩阵（逐版本起一次性实例） |
+| `npm run test:compat:matrix` | 兼容矩阵（逐版本起一次性实例；只守护当前 DSH 版本线） |
 | `npm run test:i18n:live` | 语言切换端到端（en ↔ zh） |
 | `npm run docs:matrix` | 由安全套件的 **JSON 结果**重建安全报告 §2 |
 

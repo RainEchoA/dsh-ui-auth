@@ -5,17 +5,31 @@
 > 本文取代 `docs/DSH-0.1.5-COMPATIBILITY.md`（该文对应 v0.7.0 之前的双传输线时代）。
 > 配套设计文档：[按用户隔离的模型与 API Key](RBAC-MODEL-PROFILES.md)、开发基线 [v0.7.0 路线图](ROADMAP.md)。
 
-## 1. 三档兼容矩阵
+## 1. 兼容矩阵
+
+**守护范围：只守护新版本 DSH。** `npm run test:compat:matrix` 与 GitHub Actions
+（`.github/workflows/compat-matrix.yml`）默认只跑下表"守护"档；`0.1.x` 历史版本自 v0.7.0 起
+已移除传输线、不再提供兼容保证，其历史实测记录保留在下表"考古"档**仅供参考**，不在 CI 守护范围内。
+
+### 1.1 守护（CI 每次运行）
 
 | 档位 | DSH 版本 | 结论 | 依据 |
 |---|---|---|---|
-| **目标** | `0.2.0-rc.2` | ✅ **compatible** | 一次性实例实测：插件启动并完成初始化、登录门覆盖页面/`/api`/`/plugins`/WS 升级、端点面按下文实测登记 |
-| 中间 | `0.2.0-rc.1` | ✅ compatible | 2026-09-16 实测：`test:compat:0.2.0` **38/38**（与目标版本同结论） |
-| 中间 | `0.1.7-rc.2` / `0.1.7-rc.1` | ✅ compatible | 2026-09-16 实测：两者均 **38/38**（该线出现过宿主包改名 `dsh-agent-presets` → `dsh-agent-preset`，但端点命名空间仍为 `agentPresets/*`） |
-| 中间 | `0.1.6-alpha.2` | ⚠️ 能力收窄 | 2026-09-16 实测：**37/38**，唯一失败是 `pluginManager/registries` → 404（该 alpha 尚无此端点） |
-| 中间 | `0.1.6-alpha.1` | ❌ **无法评估** | 2026-09-16 实测：**宿主自身启动失败**（上游缺陷，与本插件无关）：`SyntaxError: The requested module '@deepseek-ai/dsh-app-boot' does not provide an export named 'watchUserPatches'` → CLI 无法引导，插件根本未加载 |
-| 中间 | `0.1.5-rc.3` | ✅ compatible（能力面收窄） | 2026-09-16 实测：**34/38**；4 项失败均为该宿主**不存在的端点**（`pluginManager/*`、`permissionPresets/catalog` → 404），其余（登录门、载体桥接、Remote 授权、用户隔离、profile RPC 未解锁拒绝、R2/Q2 阻断）全部通过 |
-| 中间 | `0.1.5-rc.2` / `0.1.5-rc.1` | ✅ compatible（能力面收窄） | 2026-09-16 实测：两者均 **34/38**；4 项失败均为该宿主**不存在的端点**（`pluginManager/{listPlugins,listBundles,registries}`、`permissionPresets/catalog` → 404） |
+| **目标** | `0.2.0-rc.2` | ✅ **compatible** | 一次性实例实测：插件启动并完成初始化、登录门覆盖页面/`/api`/`/plugins`/WS 升级、端点面按下文实测登记；2026-11-07 复测 **38/38** |
+| 当前线 | `0.2.0-rc.1` | ✅ compatible | 2026-11-07 复测：`test:compat:matrix` **38/38**（与目标版本同结论） |
+
+### 1.2 考古（历史记录，不再守护）
+
+> 以下结论来自 2026-09-16 的实测。**当前版本不再为这些 DSH 版本提供兼容保证**：
+> 插件只跟随新版本开发，历史版本可能任一时刻起不再可用。
+
+| 历史档位 | DSH 版本 | 当时的结论 | 依据 |
+|---|---|---|---|
+| 历史 | `0.1.7-rc.2` / `0.1.7-rc.1` | ✅ compatible | 2026-09-16 实测：两者均 **38/38**（该线出现过宿主包改名 `dsh-agent-presets` → `dsh-agent-preset`，但端点命名空间仍为 `agentPresets/*`） |
+| 历史 | `0.1.6-alpha.2` | ⚠️ 能力收窄 | 2026-09-16 实测：**37/38**，唯一失败是 `pluginManager/registries` → 404（该 alpha 尚无此端点） |
+| 历史 | `0.1.6-alpha.1` | ❌ **无法评估** | 2026-09-16 实测：**宿主自身启动失败**（上游缺陷，与本插件无关）：`SyntaxError: The requested module '@deepseek-ai/dsh-app-boot' does not provide an export named 'watchUserPatches'` → CLI 无法引导，插件根本未加载 |
+| 历史 | `0.1.5-rc.3` | ✅ compatible（能力面收窄） | 2026-09-16 实测：**34/38**；4 项失败均为该宿主**不存在的端点**（`pluginManager/*`、`permissionPresets/catalog` → 404），其余（登录门、载体桥接、Remote 授权、用户隔离、profile RPC 未解锁拒绝、R2/Q2 阻断）全部通过 |
+| 历史 | `0.1.5-rc.2` / `0.1.5-rc.1` | ✅ compatible（能力面收窄） | 2026-09-16 实测：两者均 **34/38**；4 项失败均为该宿主**不存在的端点**（`pluginManager/{listPlugins,listBundles,registries}`、`permissionPresets/catalog` → 404） |
 | legacy | `0.1.1-rc.2` | ❌ **已移除** | dotted `/api/<a>.<b>`、`apiProxy` 事件流、自研 WS 帧编解码全部删除；缺失 `connection.authorizeIndex` 时 **fail-closed** |
 
 > **宿主版本声明的坑（v0.7.0 修复）**：旧声明 `>=0.1.1-rc.2 <0.2.0` 在 npm 的**预发布匹配规则**下
@@ -164,10 +178,10 @@ node test/live-020-check.mjs
 ```
 
 判读规则：
-- **目标版本**期望 38/38；
-- **中间版本**缺少 0.2.0 才有的端点/能力时会**预期失败**（例如 0.1.5 没有 `pluginManager/*`、`webServer.register`、
-  `registerDeepSeekProvider`）——这类失败记为 `degraded`/`unsupported`，**不是回归**；插件会走防御性回退
-  （闸门内处理 `/auth/*`）并打印明确日志；
+- **守护范围内的版本**（§1.1）期望 38/38，**任何失败都视为回归**；
+- **历史版本**（§1.2，仅供参考、不再守护）缺少 0.2.0 才有的端点/能力时会**预期失败**
+  （例如 0.1.5 没有 `pluginManager/*`、`webServer.register`、`registerDeepSeekProvider`）——
+  这类失败记为 `degraded`/`unsupported`，**不是回归**；插件会走防御性回退（闸门内处理 `/auth/*`）并打印明确日志；
 - 任何版本都**不会**因为缺失现代能力而放行：`connection.authorizeIndex` 缺失即 fail-closed。
 
 结果写回 §1 表格（结论 + 日期 + 通过数），并同步 `CHANGELOG.md` 的"已知边界"。
