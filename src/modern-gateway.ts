@@ -161,6 +161,82 @@ function replay(req: IncomingMessage, body: Buffer): IncomingMessage {
   return proxy
 }
 
+/**
+ * Read a response header case-insensitively (Node lowercases its own; a synthetic or bridging
+ * response may keep the sender's casing).
+ */
+function headerValue(headers: Record<string, unknown>, name: string): string | undefined {
+  const lowered = name.toLowerCase()
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() !== lowered) continue
+    const value = headers[key]
+    if (typeof value === 'string') return value
+    if (typeof value === 'number') return String(value)
+    if (Array.isArray(value)) return value.join(', ')
+  }
+  return undefined
+}
+
+/** Drop every spelling of `name` from a captured header record and from the response. */
+function deleteHeader(headers: Record<string, unknown>, name: string, res: ServerResponse): void {
+  const lowered = name.toLowerCase()
+  for (const key of Object.keys(headers)) if (key.toLowerCase() === lowered) delete headers[key]
+  res.removeHeader?.(lowered)
+}
+
+/** Response framing headers that stop describing the bytes once a body is re-serialized. */
+const FRAMING_HEADERS = ['content-length', 'content-encoding', 'transfer-encoding']
+
+/**
+ * Reconcile the captured headers with a body forwarded byte-for-byte.
+ *
+ * Rule: passthrough preserves the sender's encoding because the bytes are untouched;
+ * re-serialization drops framing/encoding headers because the bytes changed.
+ * - `content-encoding` is left exactly as upstream sent it. The request's `Accept-Encoding:
+ *   identity` is only a preference that host routes and third-party plugins may ignore, so
+ *   stripping `gzip` here would hand the browser compressed bytes parsed as plain content.
+ * - `content-length` is corrected only when it disagrees with the forwarded byte count.
+ * - `transfer-encoding` described the upstream hop and no longer describes this freshly
+ *   re-framed response, so only `chunked` survives.
+ */
+function passThroughHeaders(headers: Record<string, unknown>, res: ServerResponse, length: number): void {
+  const declared = headerValue(headers, 'content-length')
+  if (declared !== undefined && declared !== String(length)) deleteHeader(headers, 'content-length', res)
+  const transfer = headerValue(headers, 'transfer-encoding')
+  if (transfer !== undefined && transfer.toLowerCase() !== 'chunked') deleteHeader(headers, 'transfer-encoding', res)
+}
+
+/** The subset of a Remote response envelope that ownership projection rewrites in place. */
+interface ProjectableEnvelope {
+  result: { value?: unknown }
+}
+
+/**
+ * Return the Remote RPC envelope that ownership projection applies to, if this body carries one.
+ *
+ * The host answers a Remote call with a JSON envelope, but the same `/api/<ns>/<method>` route
+ * also serves binary and document responses: `multipart/form-data` uploads/previews, images and
+ * HTML. Only an exact `server-response` with an `ok: true` result is projected; anything else
+ * (a non-JSON body, a streamed response, a host error envelope) keeps the upstream bytes, so
+ * binary payloads never silently change on the way through the gate.
+ *
+ * Every body is offered to `JSON.parse`, never a first-byte `{` test: JSON permits leading
+ * whitespace (space, `\t`, `\n`, `\r`), so `\n{"type":"server-response",...}` is a valid
+ * envelope, and sniffing the first byte would forward it raw and bypass projection. A leading
+ * UTF-8 BOM is deliberately *not* stripped — `JSON.parse` rejects it, so a BOM-prefixed body
+ * stays byte-for-byte passthrough rather than being entrusted to a hand-rolled decoder.
+ */
+function projectableEnvelope(body: Buffer): ProjectableEnvelope | undefined {
+  let envelope: unknown
+  try { envelope = JSON.parse(body.toString('utf8')) } catch { return undefined }
+  if (envelope === null || typeof envelope !== 'object' || Array.isArray(envelope)) return undefined
+  const record = envelope as { type?: unknown; result?: { ok?: unknown } }
+  if (record.type !== 'server-response' || record.result === null || typeof record.result !== 'object' || record.result.ok !== true) {
+    return undefined
+  }
+  return record as ProjectableEnvelope
+}
+
 /** Delay success until ownership has persisted; never forward an unfiltered prefix. */
 async function forwardJson(
   forward: (req: IncomingMessage, res: ServerResponse) => void,
@@ -184,6 +260,8 @@ async function forwardJson(
     }
     res.writeHead = ((code: number, reason?: unknown, fields?: unknown) => {
       status = code
+      // Node calls writeHead(code, headers) or writeHead(code, statusMessage, headers);
+      // both spell the header object as `reason` when it is an object.
       Object.assign(headers, typeof reason === 'object' && reason !== null ? reason : fields)
       return res
     }) as typeof res.writeHead
@@ -198,18 +276,15 @@ async function forwardJson(
         try {
           capture(chunk)
           let body = Buffer.concat(chunks)
-          if (status >= 200 && status < 300) {
-            const envelope = JSON.parse(body.toString('utf8')) as { result?: { ok?: boolean; value?: unknown } }
-            if (envelope?.result?.ok === true) envelope.result.value = await transform(envelope.result.value)
+          const envelope = status >= 200 && status < 300 ? projectableEnvelope(body) : undefined
+          if (envelope !== undefined) {
+            envelope.result.value = await transform(envelope.result.value)
             body = Buffer.from(JSON.stringify(envelope))
+            for (const header of FRAMING_HEADERS) deleteHeader(headers, header, res)
+          } else {
+            passThroughHeaders(headers, res, body.length)
           }
           restore()
-          // The body is re-serialized here: framing/encoding headers of the original
-          // bytes no longer describe it, so they must not survive the projection.
-          for (const header of ['content-length', 'Content-Length', 'content-encoding', 'Content-Encoding', 'transfer-encoding', 'Transfer-Encoding']) {
-            delete headers[header]
-            res.removeHeader?.(header)
-          }
           res.writeHead(status, headers as Record<string, string>)
           res.end(body)
           if (typeof encoding === 'function') (encoding as () => void)()
@@ -400,10 +475,8 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
       })
     } catch (error) {
       // Never inherit framing/encoding headers captured from the attempt that failed.
-      for (const header of ['content-length', 'Content-Length', 'content-encoding', 'Content-Encoding', 'transfer-encoding', 'Transfer-Encoding']) {
-        delete (res.getHeaders?.() as Record<string, unknown>)[header]
-        res.removeHeader?.(header)
-      }
+      const live = (res.getHeaders?.() ?? {}) as Record<string, unknown>
+      for (const header of FRAMING_HEADERS) deleteHeader(live, header, res)
       console.error('[dsh-ui-auth] modern gateway projection failed: ' + errorMessage(error))
       if (!res.headersSent) json(res, 502, { error: 'Could not persist or project response' })
       else res.destroy()
