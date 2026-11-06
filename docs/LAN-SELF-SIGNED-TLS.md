@@ -280,7 +280,7 @@ curl -s -o /dev/null -w "trusted=%{http_code}\n" https://<实际监听地址>:<�
 | 平台 | Node.js 的信任来源 | 结果 |
 |---|---|---|
 | **macOS** | 使用 **Node 自带的一组根证书**，**不读系统钥匙串** | 即使 `security add-trusted-cert` 信任了 CA，Node 仍报 `SELF_SIGNED_CERT_IN_CHAIN` |
-| **Linux**（Node 24 实测） | **读系统 CA 存储**（OpenSSL 编译时的默认证书位置） | 装好系统 CA 后**直接可用，无需任何环境变量** |
+| **Linux**（Node 24 实测：CentOS 8 / Debian 12） | **读系统 CA 存储**（OpenSSL 编译时的默认证书位置） | 装好系统 CA 后**直接可用，无需任何环境变量**；可用 §2.3 的 `system` 字段验证 |
 | 浏览器 | macOS 读钥匙串；Linux 读 NSS/IPA 库 | 与 Node 各有自己的规则 |
 
 > ⚠️ **上一版的本文把 Linux 也写成了「不读系统 CA」，那是错的。**
@@ -362,8 +362,19 @@ node -e "const tls=require('node:tls'); console.log({
 
 | 现象 | 说明 |
 |---|---|
-| `system: 0` | Node 没启用系统 CA。macOS 上正常（读不了钥匙串）；**Linux 上装了系统 CA 后仍为 0，说明系统证书没被 OpenSSL 看到**（路径/命令用错了发行版，见 §2.1） |
-| `system` > 0 | Node 在读系统存储；此时装了 CA 就该生效 |
+| `system: 0` | Node 没读系统存储。**macOS 上这是正常的**（读不了钥匙串）；**Linux 上装了系统 CA 后仍为 0，说明证书没被 OpenSSL 看到**（路径或命令用错了发行版，见 §2.1） |
+| `system` > 0 | Node **在读**系统存储。此时装了 CA 就该生效；若仍失败，问题在证书本身（SAN / CA 链 / 过期） |
+
+**真实输出对照**（两个平台各一份，可直接比对自己的数字）：
+
+| 环境 | 输出 | 判读 |
+|---|---|---|
+| macOS / Node 24 | `{ openssl: '3.5.5', bundled: 144, system: 0 }` | 不读钥匙串 → 必须用 §2.4 的方案 |
+| **Debian 12 / Node 24** | `{ openssl: '3.0.16', bundled: 150, system: 422 }` | **在读系统存储**（422 个 CA）→ 装进系统即可，无需环境变量 |
+| CentOS 8 / Node 24 | `system` 为正值（`update-ca-trust extract` 之后） | 同上 |
+
+> `bundled` 的数字随 Node 版本变化（144 / 150 只是不同构建的差异），**不是判据**。
+> 真正要看的是 `system` 是否为 0。
 
 > ⚠️ **不要用 `process.config.variables.node_use_openssl_ca` 判断。**
 > 那是 Node **编译期**的变量，且**在现代 Node 中已不存在**（Node 24 实测为 `undefined`，
