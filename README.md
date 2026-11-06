@@ -86,6 +86,9 @@ API 或 WebSocket 通道；登录后可管理用户、邀请码、两步验证�
 | `http://127.0.0.1:3080` | ❌ 不可用 | Chrome 拒绝 IP 地址作为通行密钥域（RP ID）；面板会提示改用 `http://localhost:3080` |
 | `http://内网IP:3080` | ❌ 不可用 | 明文 HTTP 不是安全上下文，且 IP 不能作为 RP ID；需域名 + HTTPS |
 
+> **在局域网用 HTTPS 暴露面板**（自签证书、`--tls-cert` 直连）？证书信任、通行密钥域名、
+> 换证后果等限制见 **[局域网自签证书部署](docs/LAN-SELF-SIGNED-TLS.md)**。
+
 ## 安装
 
 本包是标准的 DSH profile bundle（声明了 `dsh.bundle.patch` 与 `dsh.client`），
