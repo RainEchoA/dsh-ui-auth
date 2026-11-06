@@ -2,7 +2,24 @@
 
 > **面向：**所有用户（升级前必读）。
 
-## 未发布（`main`）— Issue #3 回归补齐 + `registerPolicy` seam 修复
+## 未发布（`main`）— 兼容声明对齐实测 + 网关二进制透传修复
+
+1. **`dsh.compatibility.dshReleases` 补登 `0.2.2-rc.1: compatible`。** 此前矩阵把版本写死为
+   `0.2.0-rc.2` / `0.2.0-rc.1`，于是 npm `latest`（`0.2.2-rc.1`）从未被本插件运行过，兼容声明随之
+   落后于上游。现 CI 每次运行时**自动解析最新 rc** 并实测（与写死的区间下限 `0.2.0-rc.2` 一起跑，
+   两端合起来才佐证 `>=0.2.0-rc.2 <0.3.0`），实测 **38/38**。`0.2.0-rc.1` 保留为历史实测记录，
+   但已不在持续守护范围内——**逐版本结论以 `dshReleases` 与
+   [0.2.0 兼容性](docs/DSH-0.2.0-COMPATIBILITY.md) §1.1 为准**。
+2. **网关二进制/文档响应不再返回 502（预览打不开）。** `/api/<ns>/<method>` 上非 RPC 信封的响应
+   （图片、`multipart/form-data`、HTML）此前被一律 `JSON.parse` 后投影，解析失败即回 502。现只对
+   `{type:'server-response', result:{ok:true}}` 投影，其余**逐字节透传**。
+   同批修复两个复审缺陷：① `projectableEnvelope` 的首字节嗅探会让**带前导空白**的合法信封跳过归属
+   投影（授权面缺陷，已改为一律 `JSON.parse`）；② 透传分支误删 `content-encoding`，导致浏览器把
+   gzip 字节当明文解析。回归覆盖 `test/binary-passthrough.test.mjs`（15 例，红-绿可复现）。
+3. **CI**：新增兼容矩阵 workflow（PR / 每周 / 手动），只守护当前 DSH 版本线；`dsh-ui-auth` 的
+   README 兼容性表不再列举 `0.1.x` 历史版本。
+
+## 0.7.1 之后、本段之前的改动（Issue #3 回归补齐 + `registerPolicy` seam 修复）
 
 0.7.1 发布后补的三件事（**均已提交在 `main`；所有者决定暂不发布下一版**，因此它们尚未进入任何发行版——
 npm `latest` 仍是 0.7.1，下表第 2 条的运行时代价请按"已修复但未生效"对待）：
