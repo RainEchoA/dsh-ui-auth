@@ -1,6 +1,9 @@
 # 局域网自签证书部署
 
-> **面向：**在局域网（或没有公网域名）用 HTTPS 暴露 DSH 面板的部署者。
+> **面向：**在局域网（或没有公网域名）用 HTTPS 暴露 DSH 面板的部署者，以及**替他们执行配置的外部 agent**。
+>
+> 建议把本文直接交给外部 agent 执行（见 §0）：探查与验证是确定性操作，人工照抄容易漏掉
+> 「换证后要重新信任」「域名没进 SAN」这类细节；同时 §0.2 划出了**只能由人决定**的安全边界。
 
 DSH 支持用 `--tls-cert` / `--tls-key` 直接以 HTTPS 监听（即 README 安全说明里的「TLS 直连」形态）。
 在只有内网、没有公网域名的机器上（典型的 macOS 家用/办公环境），最常见做法是**自签一套
@@ -11,6 +14,104 @@ DSH 支持用 `--tls-cert` / `--tls-key` 直接以 HTTPS 监听（即 README 安
 
 > 如果能用反向代理（Caddy / nginx 等）终结 TLS，请优先选那条路：证书自动续期、只需在一处配置，
 > 且通行密钥用真实域名，天然规避本文大部分限制。本文面向「确实要 TLS 直连」的场景。
+
+---
+
+## 0. 用外部 agent 执行本文（推荐）
+
+本文的步骤**适合交给外部 agent 执行**：探查、签发、验证都是确定性操作，人工照抄容易漏掉
+「换证后要重新信任」「域名没进 SAN」这类细节。把这一页交给 agent，让它按下面的流程推进。
+
+### 0.1 给 agent 的指令
+
+```
+读 https://github.com/<owner>/dsh-ui-auth/blob/main/docs/LAN-SELF-SIGNED-TLS.md
+（或本地仓库的 docs/LAN-SELF-SIGNED-TLS.md），按其中 §0 的流程为我配置局域网 HTTPS。
+每一步执行前先说明你要做什么、为什么；遇到需要我决策或授权的点（见 §0.2）先停下来问我。
+```
+
+### 0.2 必须由人决定，agent 不得自行处置
+
+这些一旦做错会影响安全或他人设备，**agent 必须先征得同意**：
+
+| 事项 | 为什么不能自动做 |
+|---|---|
+| `sudo` 类操作（写系统钥匙串、改 `/etc/hosts`） | 需要管理员授权；agent 不应擅自提权 |
+| **是否信任某个 CA** | 信任一个 CA 等于信任它能签发的**任意**证书，是安全决策，不是配置细节 |
+| 选择域名 | 取决于你的内网 DNS / hosts 现状，agent 无法替你决定用哪个名字 |
+| 在其他设备上导入 CA | 涉及他人设备，需逐台人工确认（尤其 iOS 的「完全信任」开关） |
+| 改用反向代理方案 | 属于架构变更，应回到使用者决策 |
+
+### 0.3 agent 的执行流程
+
+**第一步：先探查，不要立刻改动**
+
+```bash
+# 1) DSH 当前监听方式（是否已用 --tls-cert）
+ps aux | grep -i "[d]sh .*--port" | head -3
+
+# 2) 是否已有证书，SAN 覆盖了哪些名字
+ls -l ~/.dsh/certs 2>/dev/null || ls -l ./certs 2>/dev/null
+openssl x509 -in <证书路径> -noout -text 2>/dev/null | grep -A2 "Subject Alternative Name"
+
+# 3) 本机局域网 IP 与主机名
+ipconfig getifaddr en0 2>/dev/null; scutil --get LocalHostName 2>/dev/null
+
+# 4) CA 是否已被本机信任（注意：证书「在钥匙串里」≠「被信任」）
+#    下面这条会列出所有钥匙串中同名的证书——有输出只说明证书存在，不说明信任已生效
+security find-certificate -a -c "<CA的CN>" 2>/dev/null | head -3
+
+# 5) 域名是否已能解析到本机
+dscacheutil -q host -a name <候选域名> 2>/dev/null | head -3
+```
+
+> **侦察要点**：`security find-certificate` 能找到证书，**不代表它被信任**。实测遇到过证书已导入、
+> 但信任设置未生效的情况（`security verify-cert` 报 `CSSMERR_TP_NOT_TRUSTED`）。
+> 真正的判据是 §0.3 第三步的 `curl`（不带 `-k`），不要只看证书是否存在。
+
+把探查结果**汇报给使用者**，再按 §0.2 征求决策。
+
+**第二步：按本文章节执行，每步验证**
+
+| 章节 | 何时需要 |
+|---|---|
+| §1 信任 CA | 本机首次部署，或证书报 `ERR_CERT_AUTHORITY_INVALID` |
+| §2 `--renew` vs `--regen` | 仅换叶子证书 → `--renew`；避免无谓地让所有设备重新信任 |
+| §3 域名与 SAN | 要用通行密钥，且当前用 IP 访问 |
+| §4 RP ID 与端口 | 多个实例共用同一域名 |
+| §5 localhost | 只是本机自用——**这种情况下根本不需要自签证书** |
+
+**第三步：验证（必须做，不能只看命令退出码）**
+
+> 先用 `lsof -nP -iTCP:<端口> -sTCP:LISTEN` 确认 DSH **实际监听地址**。
+> 绑定到具体局域网 IP 的实例不监听 `localhost`，地址用错会得到 `000`（连不上），
+> 与「信任没配好」是两回事——先排除前者，再判断后者。
+
+```bash
+# TLS 是否真的能握手（-k 绕过信任，验证的是服务端证书本身可用）
+curl -sk -o /dev/null -w "status=%{http_code}\n" https://<监听地址>:<端口>/auth/login
+
+# 证书链与 SAN 是否符合预期
+openssl s_client -connect <监听地址>:<端口> -servername <域名> </dev/null 2>/dev/null \
+  | openssl x509 -noout -subject -ext subjectAltName
+
+# 不带 -k 再试一次：这一步才验证「本机是否真的信任了该 CA」
+curl -s -o /dev/null -w "trusted=%{http_code}\n" https://<域名>:<端口>/auth/login
+```
+
+前两条返回 200 说明服务端本身没问题；最后一条**返回 `000` 或非 0 退出码就说明信任没配好**，
+此时不要继续下一步，回到 §1 排查。
+
+**第四步：交给使用者做人工确认**
+
+agent 完成后应明确告知使用者这些**只能由人完成**的剩余事项：
+
+- 用浏览器实际打开一次，确认无证书警告；
+- 若要通行密钥，在 `https://<域名>:<端口>` 下试绑一次（用 IP 访问时按钮会不可用，见 §3）；
+- 其他设备按 §1 各自导入 CA。
+
+> **注意**：本文的 `dsh.example.com`、`192.168.1.20` 都是**占位值**，agent 必须替换成
+> 探查到的真实值，不得直接照抄。
 
 ---
 
@@ -29,11 +130,24 @@ security add-trusted-cert -r trustRoot -p ssl \
   -k ~/Library/Keychains/login.keychain-db <你的CA证书.pem>
 ```
 
-验证是否生效：
+验证是否**真正生效**（证书存在不等于被信任）：
 
 ```bash
-security find-certificate -c "<你的CA的CN>" -a /Library/Keychains/System.keychain | head -3
+# ① 证书是否已导入（所有钥匙串）；有输出 ≠ 已信任
+security find-certificate -a -c "<你的CA的CN>" 2>/dev/null | head -3
+
+# ② 信任是否生效——这才是判据。对正在运行的面板做一次不带 -k 的请求：
+curl -s -o /dev/null -w "trusted=%{http_code}\n" https://<实际监听地址>:<端口>/auth/login
+#   返回 200 = 信任生效；返回 000 / curl 退出码非 0 = 信任未生效
 ```
+
+> ⚠️ **先确认 DSH 实际监听在哪个地址**。用 `lsof -nP -iTCP:<端口> -sTCP:LISTEN` 查。
+> DSH 绑定到具体局域网 IP 时**不监听** `localhost`/`127.0.0.1`，用错地址会得到 `000`，
+> 那是连不上，不是信任问题——两者要分清。
+
+> 实测踩过：CA 已 `add-trusted-cert` 导入、`security find-certificate` 也能找到，但
+> `security verify-cert` 仍报 `CSSMERR_TP_NOT_TRUSTED`，浏览器照旧报警。
+> 所以 **别用「证书是否在钥匙串里」判断信任**，用 ② `curl` 实测。
 
 **限制**：这只影响**当前这台机器**。
 
@@ -116,6 +230,8 @@ WebAuthn 调用——等于为了本机使用，额外引入了一整套证书�
 | 症状 | 最可能原因 |
 |---|---|
 | 浏览器报 `NET::ERR_CERT_AUTHORITY_INVALID` | CA 未导入受信任根，或导入的是叶子证书而非 CA |
+| `find-certificate` 能找到 CA，但浏览器仍报警 | 证书「存在」≠「被信任」，信任设置未生效（见 §1 的 `curl` 判据） |
+| `curl` 返回 `000` / 退出码 7 | **连不上**，不是证书问题——多半是地址/端口不对或实例未监听该地址 |
 | 浏览器正常，但其他设备报证书错误 | 只在当前机器信任了 CA（见 §1） |
 | 能登录，但一直「重新连接中」 | TLS 直连 + 插件版本 ≤ 0.7.1（见 §6） |
 | 登录页提示「不接受 IP 地址作为通行密钥域」 | 用 IP 访问，通行密钥需要域名（见 §3） |
