@@ -1,10 +1,11 @@
 # 局域网自签证书部署
 
 > **面向：**不想暴露公网、但确实要用 TLS 直连在局域网内提供 HTTPS 面板的部署者，
-> 以及**替他们执行配置的外部 agent**。
+> 以及**在这台目标节点上运行的编码 agent**（Claude Code、Codex 等）。
 >
-> 建议把本文直接交给外部 agent 执行（见 §0）：探查与验证是确定性操作，人工照抄容易漏掉
-> 「换证后要重新信任」「域名没进 SAN」这类细节；同时 §0.2 划出了**只能由人决定**的安全边界。
+> 建议把本文直接交给运行在**目标节点本机**、**有 shell 权限**的 agent 执行（见 §0.1 的前提与
+> §0.4 的流程）：探查与验证是确定性操作，人工照抄容易漏掉「换证后要重新信任」「域名没进 SAN」
+> 这类细节；同时 §0.3 划出了**只能由人决定**的安全边界。
 
 DSH 支持用 `--tls-cert` / `--tls-key` 直接以 HTTPS 监听（即 README 安全说明里的「TLS 直连」形态）。
 
@@ -81,16 +82,41 @@ xcaddy build --with github.com/caddy-dns/cloudflare
 本文的步骤**适合交给外部 agent 执行**：探查、签发、验证都是确定性操作，人工照抄容易漏掉
 「换证后要重新信任」「域名没进 SAN」这类细节。把这一页交给 agent，让它按下面的流程推进。
 
-### 0.1 给 agent 的指令
+### 0.1 前提：agent 跑在**要部署 DSH 的那台节点上**
+
+本文的「外部 agent」指的是在**目标节点本机**运行的编码 agent（Claude Code、Codex 等），
+它拥有该机器的 shell 权限，能直接执行 `lsof`、`security`、`openssl`、`curl`、`systemctl` 等命令。
+
+**不是**这样用的：
+
+| ❌ 错误用法 | 为什么不行 |
+|---|---|
+| agent 在**你的笔记本**上，让你去操作服务器 | 它看不到目标机的证书、监听地址、钥匙串、hosts，只能凭猜测写命令 |
+| agent 在一个**没有 shell 的聊天窗口**里 | §0.4 的探查与验证全部无法执行，会退化成「照着文档念」 |
+| agent 在**容器/沙箱**里，看不到宿主机 | `security`、钥匙串、`/etc/hosts` 都是宿主机的，沙箱内看不到 |
+
+**如果 agent 不在目标节点**：它只能用 **SSH 远程执行**，此时它必须能真正连上目标机并跑命令；
+否则本文对它无意义——直接人工操作更快。
+
+### 0.2 给 agent 的指令
+
+把下面这段发给**运行在目标节点上**的 agent：
 
 ```
+你运行在要部署 DSH 的这台机器上，可以直接执行本机命令。
+
 读 https://github.com/0QwQ0/dsh-ui-auth/blob/main/docs/LAN-SELF-SIGNED-TLS.md
 （或本地仓库的 docs/LAN-SELF-SIGNED-TLS.md），按其中「先确认」的判断表和 §0 的流程
 为我配置局域网 HTTPS。
-每一步执行前先说明你要做什么、为什么；遇到需要我决策或授权的点（见 §0.2）先停下来问我。
+
+要求：
+1. 每一步执行前先说明你要做什么、为什么；
+2. 遇到需要我决策或授权的点（见 §0.3 安全边界）先停下来问我，不要自行决定；
+3. 先探查（§0.4 第一步）再动手，不要假设地址、端口、证书路径；
+4. 完成后按 §0.4 第三步验证，并把「只能由人完成」的剩余事项列给我。
 ```
 
-### 0.2 必须由人决定，agent 不得自行处置
+### 0.3 必须由人决定，agent 不得自行处置
 
 这些一旦做错会影响安全或他人设备，**agent 必须先征得同意**：
 
@@ -107,34 +133,42 @@ xcaddy build --with github.com/caddy-dns/cloudflare
 > 可以拿到公网信任证书，无需本文其余步骤」——这比默默配置自签证书更有价值，
 > 但**最终选哪种仍由使用者决定**。
 
-### 0.3 agent 的执行流程
+### 0.4 agent 的执行流程
 
 **第一步：先探查，不要立刻改动**
 
-```bash
-# 1) DSH 当前监听方式（是否已用 --tls-cert）
-ps aux | grep -i "[d]sh .*--port" | head -3
+> 先用 `uname -s` 确认平台——以下命令分 macOS / Linux 两套，用错平台会得到误导性的空结果。
 
-# 2) 是否已有证书，SAN 覆盖了哪些名字
+```bash
+# 1) DSH 当前监听方式（是否已用 --tls-cert）—— 两平台通用
+ps aux | grep -i "[d]sh .*--port" | head -3
+lsof -nP -iTCP:<端口> -sTCP:LISTEN 2>/dev/null | head -3
+
+# 2) 是否已有证书，SAN 覆盖了哪些名字 —— 两平台通用
 ls -l ~/.dsh/certs 2>/dev/null || ls -l ./certs 2>/dev/null
 openssl x509 -in <证书路径> -noout -text 2>/dev/null | grep -A2 "Subject Alternative Name"
 
 # 3) 本机局域网 IP 与主机名
+#    macOS:
 ipconfig getifaddr en0 2>/dev/null; scutil --get LocalHostName 2>/dev/null
+#    Linux:
+hostname -I 2>/dev/null; hostnamectl --static 2>/dev/null || hostname
 
-# 4) CA 是否已被本机信任（注意：证书「在钥匙串里」≠「被信任」）
-#    下面这条会列出所有钥匙串中同名的证书——有输出只说明证书存在，不说明信任已生效
+# 4) CA 是否已被**系统**信任（注意：存在 ≠ 被信任；且 Node 另有规则，见 §2）
+#    macOS:
 security find-certificate -a -c "<CA的CN>" 2>/dev/null | head -3
+#    Linux:
+ls /usr/local/share/ca-certificates/ 2>/dev/null; grep -l "BEGIN CERT" /etc/ssl/certs/*.pem 2>/dev/null | head -3
 
-# 5) 域名是否已能解析到本机
-dscacheutil -q host -a name <候选域名> 2>/dev/null | head -3
+# 5) 域名是否已能解析到本机 —— 两平台通用
+getent hosts <候选域名> 2>/dev/null || dscacheutil -q host -a name <候选域名> 2>/dev/null | head -3
 ```
 
 > **侦察要点**：`security find-certificate` 能找到证书，**不代表它被信任**。实测遇到过证书已导入、
 > 但信任设置未生效的情况（`security verify-cert` 报 `CSSMERR_TP_NOT_TRUSTED`）。
-> 真正的判据是 §0.3 第三步的 `curl`（不带 `-k`），不要只看证书是否存在。
+> 真正的判据是 §0.4 第三步的 `curl`（不带 `-k`），不要只看证书是否存在。
 
-把探查结果**汇报给使用者**，再按 §0.2 征求决策。
+把探查结果**汇报给使用者**，再按 §0.3 征求决策。
 
 **第二步：按本文章节执行，每步验证**
 
