@@ -23,6 +23,7 @@
 | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | 贡献者 | 开发环境、测试、提交与文档规范 |
 | [`docs/INDEX.md`](INDEX.md) | 所有读者 | 本文档（角色导航） |
 | [`docs/OPERATIONS.md`](OPERATIONS.md) | 部署者 / 运维 | 环境变量、数据与持久化、备份恢复、升级回滚、排障 |
+| [`docs/LAN-SELF-SIGNED-TLS.md`](LAN-SELF-SIGNED-TLS.md) | 部署者 / 运维 | 局域网用自签证书 + TLS 直连暴露面板：证书信任、通行密钥域名、换证后果与排查清单 |
 | [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) | 开发者 | 模块地图、请求流、数据模型、扩展点、测试策略 |
 | [`docs/SECURITY.md`](SECURITY.md) | 审计员 | 威胁模型、信任边界、加密与密钥、权限矩阵、残余风险、审计清单 |
 | [`docs/SECURITY-VERIFICATION.md`](SECURITY-VERIFICATION.md) | 审计员 | 安全验证报告（用例矩阵、发现与修复、复现命令） |
