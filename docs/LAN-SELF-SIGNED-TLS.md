@@ -164,6 +164,10 @@ ls /usr/local/share/ca-certificates/*.crt /etc/pki/ca-trust/source/anchors/*.pem
 #    确认 CA 是否真的进了 OpenSSL 读取的 bundle（RHEL 系看 ca-bundle.crt）：
 openssl crl2pkcs7 -nocrl -certfile /etc/pki/tls/certs/ca-bundle.crt 2>/dev/null | grep -c "BEGIN CERTIFICATE"
 
+# 4b) Node 自己认为它信任什么 —— 比看文件更直接的运行时事实（详见 §2.3）
+node -e "const t=require('node:tls'); console.log({openssl:process.versions.openssl,
+  bundled:t.getCACertificates('bundled').length, system:t.getCACertificates('system').length})"
+
 # 5) 域名是否已能解析到本机 —— 两平台通用
 getent hosts <候选域名> 2>/dev/null || dscacheutil -q host -a name <候选域名> 2>/dev/null | head -3
 ```
@@ -295,7 +299,7 @@ curl -s -o /dev/null -w "trusted=%{http_code}\n" https://<实际监听地址>:<�
 
 **关键结论：**
 
-- **macOS**：系统信任与 Node 信任是**两件事**，必须额外给 Node 传 CA（§2.3）；
+- **macOS**：系统信任与 Node 信任是**两件事**，必须额外给 Node 传 CA（§2.4）；
 - **Linux**：只要装进系统 CA 存储（用对发行版的命令），**浏览器和 Node 一并生效**，最省事；
 - 两边都不要假设对方的行为——先按 §0.4 的探查确认。
 
@@ -310,7 +314,7 @@ node --use-system-ca -e "..."                                              # →
 ```
 
 > 实测：在 macOS 上 `--use-system-ca`（Node 提供的「改用系统 CA」开关）**也解决不了**——
-> 它不会让 Node 读取钥匙串中**用户手动信任**的 CA。macOS 只能用 §2.3 的方案。
+> 它不会让 Node 读取钥匙串中**用户手动信任**的 CA。macOS 只能用 §2.4 的方案。
 
 **Linux**（装进系统 CA 存储，Node 直接可用）：
 
@@ -334,7 +338,47 @@ node -e "require('node:https').get('https://<地址>:<端口>/auth/login',r=>{co
 # → SELF_SIGNED_CERT_IN_CHAIN
 ```
 
-### 2.3 解法
+### 2.3 诊断：Node 到底信任哪些 CA
+
+排查证书问题时，先让 Node 自己说清楚「它现在信任什么」，比猜快得多。
+
+```bash
+node -e "const tls=require('node:tls'); console.log({
+  openssl: process.versions.openssl,
+  bundled: tls.getCACertificates('bundled').length,
+  system:  tls.getCACertificates('system').length,
+})"
+```
+
+各字段含义：
+
+| 字段 | 含义 |
+|---|---|
+| `openssl` | Node 链接的 OpenSSL 版本 |
+| `bundled` | **Node 自带**的根证书数量（通常 100+） |
+| `system` | **从系统读取**的根证书数量；`0` 表示没走系统存储 |
+
+对照判断：
+
+| 现象 | 说明 |
+|---|---|
+| `system: 0` | Node 没启用系统 CA。macOS 上正常（读不了钥匙串）；**Linux 上装了系统 CA 后仍为 0，说明系统证书没被 OpenSSL 看到**（路径/命令用错了发行版，见 §2.1） |
+| `system` > 0 | Node 在读系统存储；此时装了 CA 就该生效 |
+
+> ⚠️ **不要用 `process.config.variables.node_use_openssl_ca` 判断。**
+> 那是 Node **编译期**的变量，且**在现代 Node 中已不存在**（Node 24 实测为 `undefined`，
+> `process.config.variables` 里只剩 `node_use_openssl`）。用它判断会得到一个永远是
+> `undefined` 的假阴性。用上面的 `tls.getCACertificates('system')` 才是运行时事实。
+
+**另一条更直接的判据**：Node 自己在证书校验失败时会提示
+
+```
+If the root CA is installed locally, try running Node.js with --use-system-ca flag
+```
+
+如果这条提示出现，说明 Node **没有**把该 CA 视为可信——这是最可靠的信号。
+
+### 2.4 解法
 
 按「影响范围」从大到小排列，任选其一：
 
@@ -385,7 +429,7 @@ NODE_TLS_REJECT_UNAUTHORIZED=0 node ...
 > 为什么单独点名：很多排障帖会建议这个开关。它会让**所有** TLS 校验失效（包括 DSH 访问
 > 外部 API 的连接），把证书问题变成静默的安全洞。用它定位完就必须撤掉。
 
-### 2.4 各场景该用哪种
+### 2.5 各场景该用哪种
 
 | 场景 | macOS | Linux（Debian 系） | Linux（RHEL 系） |
 |---|---|---|---|
@@ -397,11 +441,11 @@ NODE_TLS_REJECT_UNAUTHORIZED=0 node ...
 > **建议**：如果目标机器不确定，或者要用一份配置覆盖多种环境，用 `NODE_EXTRA_CA_CERTS`——
 > 它在 macOS 和 Linux 上行为一致。Linux 上额外装系统 CA 的好处是 DSH 之外的工具也一并信任。
 
-### 2.5 常见误区
+### 2.6 常见误区
 
 | 做法 | 为什么不够 |
 |---|---|
-| 只做了 `security add-trusted-cert`（macOS） | 只修好浏览器；**Node 仍不信任**——macOS 上必须额外处理（§2.3） |
+| 只做了 `security add-trusted-cert`（macOS） | 只修好浏览器；**Node 仍不信任**——macOS 上必须额外处理（§2.4） |
 | 以为 Linux 上也一样要设 `NODE_EXTRA_CA_CERTS` | Linux 会读系统 CA，装好后本就可用；多设一个变量不会错，但别以为系统 CA 白装了 |
 | 在 CentOS 上跑 `update-ca-certificates` | 那是 Debian 系的命令，RHEL 系要用 `update-ca-trust extract` |
 | 只把文件放进 `anchors/` 却没执行更新命令 | RHEL 系需要 `update-ca-trust extract` 才会合并进 `ca-bundle.crt` |
@@ -481,8 +525,8 @@ WebAuthn 调用——等于为了本机使用，额外引入了一整套证书�
 | 症状 | 最可能原因 |
 |---|---|
 | 浏览器报 `NET::ERR_CERT_AUTHORITY_INVALID` | CA 未导入受信任根，或导入的是叶子证书而非 CA |
-| 浏览器正常，但 **Node 脚本报 `SELF_SIGNED_CERT_IN_CHAIN`** | **浏览器与 Node 是两套信任链**。macOS 上 Node 不读钥匙串，必须额外配（§2.3）；Linux 装好系统 CA 通常就够 |
-| 设了 `NODE_EXTRA_CA_CERTS` 却没效果 | 该变量只在**进程启动时**读取，必须重启进程（见 §2.3） |
+| 浏览器正常，但 **Node 脚本报 `SELF_SIGNED_CERT_IN_CHAIN`** | **浏览器与 Node 是两套信任链**。macOS 上 Node 不读钥匙串，必须额外配（§2.4）；Linux 装好系统 CA 通常就够 |
+| 设了 `NODE_EXTRA_CA_CERTS` 却没效果 | 该变量只在**进程启动时**读取，必须重启进程（见 §2.4） |
 | `find-certificate` 能找到 CA，但浏览器仍报警 | 证书「存在」≠「被信任」，信任设置未生效（见 §1 的 `curl` 判据） |
 | `curl` 返回 `000` / 退出码 7 | **连不上**，不是证书问题——多半是地址/端口不对或实例未监听该地址 |
 | 浏览器正常，但其他设备报证书错误 | 只在当前机器信任了 CA（见 §1） |
