@@ -1,0 +1,138 @@
+# 兼容矩阵（`npm run test:compat:matrix`）的 CI 封装。
+#
+# 矩阵脚本对每个 DSH 版本：装一次性 CLI + profile（把本仓库作为插件加入）→ 启动到独立端口
+# → 跑 `test/live-020-check.mjs`（同一套 38 项断言）→ 汇总。它**本机可复现**，但很慢
+# （每个版本约 1~3 分钟：npm install 整个 CLI + 启动宿主），所以不放进 `npm test`，
+# 单独一个 workflow 跑。
+#
+# 守护范围：**只守护新版本 DSH**。DSH 0.1.x 历史版本自 v0.7.0 起已移除传输线、不再提供兼容保证。
+# 默认跑两个端点，合起来才真正佐证 package.json 里 `>=0.2.0-rc.2 <0.3.0` 的声明：
+#   - **最新 rc**：运行时从 npm 的 dist-tag 动态解析，上游发新版后无需改代码即可发现不兼容；
+#   - **区间下限**：`0.2.0-rc.2` 写死在脚本里，防止"只测最新版能用"却悄悄丢了下限兼容。
+# 探测不到最新版时（离线/限流）退回下限并明确告警，不会静默跳过守护。
+# 历史版本的实测记录仍保留在 docs/DSH-0.2.0-COMPATIBILITY.md 供考古，但不再是 CI 的守护对象。
+#
+# 触发策略：
+#   - pull_request：跑守护范围；路径过滤到插件源码/矩阵脚本本身，改文档不会触发。
+#   - workflow_dispatch：可手填版本（考古历史版本，或提前试某个特定版本）。
+#   - schedule：每周跑一次，及时跟住上游新发的 rc。
+#
+# 判读口径见 docs/DSH-0.2.0-COMPATIBILITY.md：历史版本里"宿主不存在的端点"返回 404 属于
+# **能力收窄**而非回归。矩阵脚本据此设置退出码——只有"未能评估"（装不上/起不来/没产出
+# 结果行）才是硬失败。想连能力收窄也判红时，手动触发并把 strict 设为 true。
+name: Compatibility Matrix
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'test/live-020-check.mjs'
+      - 'test/live-compat-matrix.mjs'
+      - 'package.json'
+      - 'cordis.patch.yml'
+      - '.github/workflows/compat-matrix.yml'
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: '空格分隔的 DSH 版本；留空 = 自动识别最新 rc + 区间下限'
+        required: false
+        default: ''
+      strict:
+        description: '把"能力收窄"（如 37/38）也判为失败'
+        type: boolean
+        default: false
+  schedule:
+    # 每周一 04:23 UTC（避开整点排队，也和 npm-publish 的 03:17 错开）
+    - cron: '23 4 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compat-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  matrix:
+    name: 兼容矩阵
+    runs-on: ubuntu-latest
+    # 守护线是 2 个版本，每个约 1~3 分钟；留足余量。跑满即判失败。
+    timeout-minutes: 20
+    env:
+      # devDependencies 含 puppeteer；矩阵只需要 CLI，跳过 Chromium 下载
+      PUPPETEER_SKIP_DOWNLOAD: 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # `dsh plugin add` 内部用 pnpm 装插件；GitHub runner 默认没有 pnpm，
+      # 缺了它矩阵会在"装插件"一步失败，然后表现为一堆看不懂的断言错误。
+      # 用官方 action 装（corepack prepare 在新版 Node 上已废弃）。
+      # 必须放在 setup-node 之后：该 action 依赖 NODE 环境。
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Show pnpm
+        run: pnpm --version
+
+      # 矩阵脚本用 `npm install @deepseek-ai/dsh@<version>` 起一次性 CLI，
+      # 因此 runner 自带的 npm 必须能解析这些版本（需要 registry 访问）。
+      - name: Show tool versions
+        run: |
+          node --version
+          npm --version
+
+      - name: Install repository dependencies
+        run: npm ci --no-audit --no-fund
+
+      # 矩阵会把本仓库**作为插件**装进一次性 profile，所以 lib/ 必须存在且与 src/ 一致。
+      # lib/ 是已提交的构建产物；这里重新构建一次以确保测的是当前源码。
+      - name: Build the plugin
+        run: npm run build
+
+      - name: Verify the committed build output matches src
+        run: |
+          set -euo pipefail
+          if ! git diff --exit-code -- lib; then
+            echo "::error::lib/ 与 src/ 不同步：请在本地运行 npm run build 并提交产物"
+            exit 1
+          fi
+
+      - name: Run the compatibility matrix
+        env:
+          # 留空则由脚本自行解析版本：最新 rc（npm dist-tag）+ 区间下限；
+          # strict 只在手动触发时由 input 控制
+          VERSIONS: ${{ inputs.versions }}
+          MATRIX_STRICT: ${{ inputs.strict && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          if [ -n "${VERSIONS}" ]; then
+            echo "::notice::目标版本（手动指定）：${VERSIONS}"
+            # shellcheck disable=SC2086
+            node test/live-compat-matrix.mjs ${VERSIONS}
+          else
+            echo "::notice::未指定版本：自动识别最新 rc + 兼容区间下限"
+            node test/live-compat-matrix.mjs
+          fi
+
+      # 结果表格已由脚本写进 job summary；这里把 JSON 也挂成 artifact，
+      # 便于回填 docs/DSH-0.2.0-COMPATIBILITY.md 时直接取用。
+      - name: Upload the matrix result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-matrix
+          path: matrix-result.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      # 失败时把每个版本的一次性根目录清掉（脚本自己会清，但超时被杀时可能残留）
+      - name: Clean up stray instances
+        if: always()
+        run: |
+          pkill -f 'dsh.*--port' 2>/dev/null || true
+          rm -rf "${TMPDIR:-/tmp}"/dsh-matrix-* 2>/dev/null || true
