@@ -15,3 +15,8 @@ dsh-ui-auth-audit.jsonl
 dsh-ui-auth-sessions.json
 dsh-ui-auth-users.json
 .security-suite-result.json
+
+# 本机安装的 agent skill 及其锁文件：属于开发者的工具链本地状态，
+# 与插件运行时无关，且各人环境不同——不应进入仓库。
+.agents/
+.secure-skills/
