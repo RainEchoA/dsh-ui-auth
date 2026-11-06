@@ -157,8 +157,12 @@ hostname -I 2>/dev/null; hostnamectl --static 2>/dev/null || hostname
 # 4) CA 是否已被**系统**信任（注意：存在 ≠ 被信任；且 Node 另有规则，见 §2）
 #    macOS:
 security find-certificate -a -c "<CA的CN>" 2>/dev/null | head -3
-#    Linux:
-ls /usr/local/share/ca-certificates/ 2>/dev/null; grep -l "BEGIN CERT" /etc/ssl/certs/*.pem 2>/dev/null | head -3
+#    Linux — 先确认发行版系别，再看对应目录：
+#      Debian/Ubuntu:  /usr/local/share/ca-certificates/
+#      RHEL/CentOS:    /etc/pki/ca-trust/source/anchors/
+ls /usr/local/share/ca-certificates/*.crt /etc/pki/ca-trust/source/anchors/*.pem 2>/dev/null | head -3
+#    确认 CA 是否真的进了 OpenSSL 读取的 bundle（RHEL 系看 ca-bundle.crt）：
+openssl crl2pkcs7 -nocrl -certfile /etc/pki/tls/certs/ca-bundle.crt 2>/dev/null | grep -c "BEGIN CERTIFICATE"
 
 # 5) 域名是否已能解析到本机 —— 两平台通用
 getent hosts <候选域名> 2>/dev/null || dscacheutil -q host -a name <候选域名> 2>/dev/null | head -3
@@ -272,17 +276,27 @@ curl -s -o /dev/null -w "trusted=%{http_code}\n" https://<实际监听地址>:<�
 | 平台 | Node.js 的信任来源 | 结果 |
 |---|---|---|
 | **macOS** | 使用 **Node 自带的一组根证书**，**不读系统钥匙串** | 即使 `security add-trusted-cert` 信任了 CA，Node 仍报 `SELF_SIGNED_CERT_IN_CHAIN` |
-| **Linux** | **读系统 CA 存储**（`/etc/ssl/certs`，即 OpenSSL 的默认证书目录） | `update-ca-certificates` 装好 CA 后，**Node 直接就能用，无需任何环境变量** |
+| **Linux**（Node 24 实测） | **读系统 CA 存储**（OpenSSL 编译时的默认证书位置） | 装好系统 CA 后**直接可用，无需任何环境变量** |
 | 浏览器 | macOS 读钥匙串；Linux 读 NSS/IPA 库 | 与 Node 各有自己的规则 |
 
 > ⚠️ **上一版的本文把 Linux 也写成了「不读系统 CA」，那是错的。**
-> 实测修正：Linux 上把 CA 放进 `/usr/local/share/ca-certificates/` 并执行
-> `update-ca-certificates` 后，Node 默认即可信任，不需要 `NODE_EXTRA_CA_CERTS`。
+> 实测：Node 24 + CentOS 8，把 CA 装进系统信任存储后，Node 默认即可信任，不需要
+> `NODE_EXTRA_CA_CERTS`。
+
+**Linux 发行版的 CA 路径与命令并不统一**（这是 §1 之外最容易漏的一层差异）：
+
+| 发行版 | 放入目录 | 生效命令 | OpenSSL 读取的文件 |
+|---|---|---|---|
+| **Debian / Ubuntu** | `/usr/local/share/ca-certificates/` | `sudo update-ca-certificates` | `/etc/ssl/certs/ca-certificates.crt` |
+| **RHEL / CentOS / Rocky / Alma** | `/etc/pki/ca-trust/source/anchors/` | `sudo update-ca-trust extract` | `/etc/pki/tls/certs/ca-bundle.crt` |
+
+> 把 Debian 的 `update-ca-certificates` 用在 CentOS 上会直接报命令不存在——
+> 这跟证书本身无关，只是用错了发行版的工具。
 
 **关键结论：**
 
 - **macOS**：系统信任与 Node 信任是**两件事**，必须额外给 Node 传 CA（§2.3）；
-- **Linux**：只要装进系统 CA 存储，**浏览器和 Node 一并生效**，最省事；
+- **Linux**：只要装进系统 CA 存储（用对发行版的命令），**浏览器和 Node 一并生效**，最省事；
 - 两边都不要假设对方的行为——先按 §0.4 的探查确认。
 
 ### 2.2 实测对照
@@ -301,12 +315,19 @@ node --use-system-ca -e "..."                                              # →
 **Linux**（装进系统 CA 存储，Node 直接可用）：
 
 ```bash
+# Debian / Ubuntu
 sudo cp ca.crt /usr/local/share/ca-certificates/dsh-local-ca.crt
 sudo update-ca-certificates
 
-# 不需要 NODE_EXTRA_CA_CERTS
+# RHEL / CentOS / Rocky / Alma（CentOS 8 实测）
+sudo cp ca.crt /etc/pki/ca-trust/source/anchors/dsh-local-ca.crt
+sudo update-ca-trust extract
+
+# 两种情况都不需要 NODE_EXTRA_CA_CERTS
 node -e "require('node:https').get('https://<地址>:<端口>/auth/login', r => console.log(r.statusCode))"  # → 200
 ```
+
+> 实测环境：**Node 24 + CentOS 8**，`update-ca-trust extract` 之后 Node 默认即信任。
 
 # Node 仍失败
 node -e "require('node:https').get('https://<地址>:<端口>/auth/login',r=>{console.log(r.statusCode);process.exit()}).on('error',e=>{console.log(e.code);process.exit()})"
@@ -317,8 +338,9 @@ node -e "require('node:https').get('https://<地址>:<端口>/auth/login',r=>{co
 
 按「影响范围」从大到小排列，任选其一：
 
-> **Linux 用户注意**：如果你的 CA 已经通过 `update-ca-certificates` 装进系统存储，**通常不需要
-> 本节任何方案**——Node 会直接读取。先用下面的 `node -e` 验证一下，能通过就跳过。
+> **Linux 用户注意**：如果 CA 已经装进系统信任存储（Debian 系 `update-ca-certificates` /
+> RHEL 系 `update-ca-trust extract`），**通常不需要本节任何方案**——Node 会直接读取。
+> 先用下面的 `node -e` 验证一下，能通过就跳过。
 > `NODE_EXTRA_CA_CERTS` 主要是给 **macOS** 用的，以及用于跨平台统一。
 
 **方案 A：`NODE_EXTRA_CA_CERTS`（最通用，macOS 必备）**
@@ -365,15 +387,15 @@ NODE_TLS_REJECT_UNAUTHORIZED=0 node ...
 
 ### 2.4 各场景该用哪种
 
-| 场景 | macOS | Linux |
-|---|---|---|
-| 让 **DSH 进程**信任自签证书 | `export NODE_EXTRA_CA_CERTS=...`（或写进 launchd 的 service 环境） | **装进系统 CA 即可**：`update-ca-certificates`，无需环境变量 |
-| 跑 `test/live-*.mjs` 等仓库脚本 | 同上（`test/tls-mux-scheme.run.mjs` 已用 launcher 注入） | 同上，装系统 CA 后直接可用 |
-| 只是浏览器访问面板 | 动浏览器信任链（§1），不需要动 Node | 同 macOS |
-| 需要**跨平台统一**的做法 | `NODE_EXTRA_CA_CERTS` 两端都有效 | 同左 |
+| 场景 | macOS | Linux（Debian 系） | Linux（RHEL 系） |
+|---|---|---|---|
+| 让 **DSH 进程**信任自签证书 | `export NODE_EXTRA_CA_CERTS=...`（或写进 launchd 环境） | `update-ca-certificates`，无需环境变量 | `update-ca-trust extract`，无需环境变量 |
+| 跑 `test/live-*.mjs` 等仓库脚本 | 同上（`tls-mux-scheme.run.mjs` 已用 launcher 注入） | 同上，装系统 CA 后直接可用 | 同左 |
+| 只是浏览器访问面板 | 动浏览器信任链（§1），不需要动 Node | 同 macOS | 同 macOS |
+| 需要**跨平台统一**的做法 | `NODE_EXTRA_CA_CERTS` 三处都有效 | 同左 | 同左 |
 
-> **建议**：如果不确定目标机器是哪种情况，用 `NODE_EXTRA_CA_CERTS`——它在 macOS 和 Linux
-> 上行为一致。Linux 上额外做系统 CA 安装可以让 DSH 之外的工具也一并信任。
+> **建议**：如果目标机器不确定，或者要用一份配置覆盖多种环境，用 `NODE_EXTRA_CA_CERTS`——
+> 它在 macOS 和 Linux 上行为一致。Linux 上额外装系统 CA 的好处是 DSH 之外的工具也一并信任。
 
 ### 2.5 常见误区
 
@@ -381,6 +403,8 @@ NODE_TLS_REJECT_UNAUTHORIZED=0 node ...
 |---|---|
 | 只做了 `security add-trusted-cert`（macOS） | 只修好浏览器；**Node 仍不信任**——macOS 上必须额外处理（§2.3） |
 | 以为 Linux 上也一样要设 `NODE_EXTRA_CA_CERTS` | Linux 会读系统 CA，装好后本就可用；多设一个变量不会错，但别以为系统 CA 白装了 |
+| 在 CentOS 上跑 `update-ca-certificates` | 那是 Debian 系的命令，RHEL 系要用 `update-ca-trust extract` |
+| 只把文件放进 `anchors/` 却没执行更新命令 | RHEL 系需要 `update-ca-trust extract` 才会合并进 `ca-bundle.crt` |
 | 用 `curl -k` 验证通过 | `-k` 是**跳过**校验，不能证明任何信任关系成立 |
 | 设了 `NODE_EXTRA_CA_CERTS` 但没重启进程 | 该变量只在启动时读取 |
 
