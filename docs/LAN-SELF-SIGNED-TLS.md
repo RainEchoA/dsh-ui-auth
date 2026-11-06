@@ -429,19 +429,70 @@ NODE_TLS_REJECT_UNAUTHORIZED=0 node ...
 > 为什么单独点名：很多排障帖会建议这个开关。它会让**所有** TLS 校验失效（包括 DSH 访问
 > 外部 API 的连接），把证书问题变成静默的安全洞。用它定位完就必须撤掉。
 
-### 2.5 各场景该用哪种
+### 2.5 用环境变量控制 Node 的 CA 来源（Linux 尤其有用）
+
+在 Linux 上**不修改系统存储**也能让 Node 信任你的 CA——适合容器、`systemd` 单元、或不想动
+`update-ca-trust` 的场景。
+
+**对 Node 真正有效的是两个变量：**
+
+| 变量 | 作用 | 生效范围 | 实测（Node 24） |
+|---|---|---|---|
+| **`NODE_EXTRA_CA_CERTS`** | **追加**一个 PEM 文件到 Node 的 CA 列表 | 仅 Node | ✅ **有效** |
+| **`NODE_OPTIONS=--use-system-ca`** | 让 Node 改用系统 CA 存储 | 仅 Node | 标志被接受；Linux 上会读系统 CA，macOS 上读不到钥匙串（§2.2） |
+
+> ⚠️ **`SSL_CERT_FILE` / `SSL_CERT_DIR` 对 Node 无效。**
+> 这两个是 **OpenSSL 的标准环境变量**，`curl`、`openssl s_client` 等 OpenSSL 命令行工具会读，
+> 但 **Node 内置的 TLS / `fetch` 不读它们**——实测设置后 `tls.getCACertificates('system')`
+> 仍是 `0`，连接依旧报 `SELF_SIGNED_CERT_IN_CHAIN`。
+>
+> 排查时容易误判：设了 `SSL_CERT_FILE` 后 `curl` 能通、`node` 仍失败，于是以为「Node 的配置没生效」，
+> 实际是**这两个变量从来就不在 Node 的生效路径上**。也能反过来误判成功——
+> 如果环境里同时有 `NODE_EXTRA_CA_CERTS`，`SSL_CERT_FILE` 的「测试通过」其实是前者在起作用。
+
+**`NODE_EXTRA_CA_CERTS` 用法**（Linux / macOS 通用）：
+
+```bash
+# 只让 Node 额外信任这个 CA，不影响其他程序
+export NODE_EXTRA_CA_CERTS=/etc/pki/ca-trust/source/anchors/dsh-local-ca.crt
+
+# 验证（不带任何 -k）
+node -e "require('node:https').get('https://<地址>:<端口>/auth/login', r => {
+  console.log('✅', r.statusCode); process.exit()
+}).on('error', e => { console.log('❌', e.code); process.exit(1) })"
+```
+
+> ⚠️ **`NODE_TLS_REJECT_UNAUTHORIZED=0` 不是同类方案**：它**关掉校验**，不是「信任这个 CA」。
+> 见 §2.4 对它的警告。
+
+写进 `systemd` 单元的例子：
+
+```ini
+# /etc/systemd/system/dsh-web.service.d/ca.conf
+[Service]
+Environment=NODE_EXTRA_CA_CERTS=/etc/pki/ca-trust/source/anchors/dsh-local-ca.crt
+```
+
+> 修改后必须 `sudo systemctl daemon-reload && sudo systemctl restart dsh-web`——
+> 环境变量只在进程启动时读取。
+
+**至于「用系统 CA」这条路**：Linux 上最省事的仍是 §2.1 的装法——把 CA 装进系统存储，
+Node 会读，不需要任何环境变量。
+
+### 2.6 各场景该用哪种
 
 | 场景 | macOS | Linux（Debian 系） | Linux（RHEL 系） |
 |---|---|---|---|
-| 让 **DSH 进程**信任自签证书 | `export NODE_EXTRA_CA_CERTS=...`（或写进 launchd 环境） | `update-ca-certificates`，无需环境变量 | `update-ca-trust extract`，无需环境变量 |
+| 让 **DSH 进程**信任自签证书 | `export NODE_EXTRA_CA_CERTS=...`（或写进 launchd 环境） | `update-ca-certificates`，或 `NODE_EXTRA_CA_CERTS`（见 §2.5） | `update-ca-trust extract`，或 `NODE_EXTRA_CA_CERTS`（见 §2.5） |
 | 跑 `test/live-*.mjs` 等仓库脚本 | 同上（`tls-mux-scheme.run.mjs` 已用 launcher 注入） | 同上，装系统 CA 后直接可用 | 同左 |
 | 只是浏览器访问面板 | 动浏览器信任链（§1），不需要动 Node | 同 macOS | 同 macOS |
+| 不想动系统存储（容器 / 无 root） | — | `NODE_EXTRA_CA_CERTS`（§2.5） | 同左 |
 | 需要**跨平台统一**的做法 | `NODE_EXTRA_CA_CERTS` 三处都有效 | 同左 | 同左 |
 
 > **建议**：如果目标机器不确定，或者要用一份配置覆盖多种环境，用 `NODE_EXTRA_CA_CERTS`——
 > 它在 macOS 和 Linux 上行为一致。Linux 上额外装系统 CA 的好处是 DSH 之外的工具也一并信任。
 
-### 2.6 常见误区
+### 2.7 常见误区
 
 | 做法 | 为什么不够 |
 |---|---|
