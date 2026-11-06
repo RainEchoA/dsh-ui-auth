@@ -603,8 +603,13 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
       const correlation: StreamCorrelation = { login: auth.loginKey(req), events: new Set<string>() }
       correlations.add(correlation)
       let upstream: WebSocket
+      // DSH 以 --tls-cert/--tls-key 直接监听（TLS 直连）时，宿主端口只有 TLS：
+      // 回连 scheme 必须随入站升级的 socket 加密状态推导，写死 ws:// 会在握手阶段
+      // 即被断开 → 上游永远连不上 → 前端无限「重新连接中」、会话列表为空。
+      // 反代终结 TLS 时入站 socket 仍是明文，自动保持 ws://，行为不变。
+      const upstreamScheme = (req.socket as { encrypted?: boolean }).encrypted === true ? 'wss' : 'ws'
       try {
-        upstream = new WebSocket(`ws://${info.host}/api/remote.mux`, {
+        upstream = new WebSocket(`${upstreamScheme}://${info.host}/api/remote.mux`, {
           maxPayload: MAX_BODY,
           headers: { ...(info.cookie === undefined ? {} : { cookie: info.cookie }), [MUX_PROXY_HEADER]: muxProxyNonce },
         })
