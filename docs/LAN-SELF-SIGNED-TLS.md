@@ -175,7 +175,7 @@ getent hosts <候选域名> 2>/dev/null || dscacheutil -q host -a name <候选�
 | 章节 | 何时需要 |
 |---|---|
 | §1 信任 CA | 本机首次部署，或浏览器证书报 `ERR_CERT_AUTHORITY_INVALID` |
-| §2 **Node 信任证书** | `curl` 通了但 Node 脚本/DSH 报 `SELF_SIGNED_CERT_IN_CHAIN` —— 浏览器与 Node 是两套信任 |
+| §2 **Node 信任证书** | `curl` 通了但 Node 脚本/DSH 报 `SELF_SIGNED_CERT_IN_CHAIN` —— macOS 常见（不读钥匙串）；Linux 装了系统 CA 一般不会遇到 |
 | §3 `--renew` vs `--regen` | 仅换叶子证书 → `--renew`；避免无谓地让所有设备重新信任 |
 | §4 域名与 SAN | 要用通行密钥，且当前用 IP 访问 |
 | §5 RP ID 与端口 | 多个实例共用同一域名 |
@@ -257,44 +257,77 @@ curl -s -o /dev/null -w "trusted=%{http_code}\n" https://<实际监听地址>:<�
 
 内网长期使用，建议用内部 CA 统一签发，并把 CA 一次性下发到各设备。
 
-## 2. Node.js 不信任系统证书 —— macOS 与 Linux 的差异与解法
+## 2. Node.js 与系统证书的信任差异 —— macOS 与 Linux **行为不同**
 
-**这是最容易卡住的一步。** 浏览器信任了证书，不等于**跑在 Node.js 里的程序**也信任——
-而 DSH 本身就是 Node 程序，插件测试脚本（`test/live-*.mjs`）也用 Node 的 `fetch`/`https`。
+**这是最容易卡住、也最容易写错的一条。** 浏览器信任了证书，不等于**跑在 Node.js 里的程序**也信任——
+而 DSH 本身就是 Node 程序，插件测试脚本也用 Node 的 `fetch`/`https`。
+
+**但两个平台的结论不一样**：macOS 上 Node **不读**系统信任，需要额外配置；Linux 上 Node
+**读**系统 CA 存储，装好系统 CA 就够。**下面 §2.1 的对照表是本节最重要的内容。**
 
 ### 2.1 差异从哪来
 
+**macOS 和 Linux 的行为不一样**——这是本节最容易被忽略、也最容易踩坑的地方：
+
 | 平台 | Node.js 的信任来源 | 结果 |
 |---|---|---|
-| **macOS** | 使用 **Node 自带的一组根证书**，**不读系统钥匙串** | 即使你 `security add-trusted-cert` 信任了 CA，Node 仍报 `self-signed certificate in certificate chain` |
-| **Linux** | 同样使用 Node 自带根证书，**不读** `/etc/ssl/certs` | 即使 `update-ca-certificates` 装好了 CA，Node 仍不信任 |
-| 浏览器（Chrome / Safari） | macOS 读钥匙串；Linux 多数读 NSS/IPA 库 | 与 Node **不是同一套规则** |
+| **macOS** | 使用 **Node 自带的一组根证书**，**不读系统钥匙串** | 即使 `security add-trusted-cert` 信任了 CA，Node 仍报 `SELF_SIGNED_CERT_IN_CHAIN` |
+| **Linux** | **读系统 CA 存储**（`/etc/ssl/certs`，即 OpenSSL 的默认证书目录） | `update-ca-certificates` 装好 CA 后，**Node 直接就能用，无需任何环境变量** |
+| 浏览器 | macOS 读钥匙串；Linux 读 NSS/IPA 库 | 与 Node 各有自己的规则 |
 
-**关键结论：在 Node.js 里，「系统信任」和「Node 信任」是两件事。** 这条在 macOS 和 Linux 上
-**都成立**——两者都不自动继承系统 CA（Windows 上 Node 会读系统证书存储，是唯一例外）。
+> ⚠️ **上一版的本文把 Linux 也写成了「不读系统 CA」，那是错的。**
+> 实测修正：Linux 上把 CA 放进 `/usr/local/share/ca-certificates/` 并执行
+> `update-ca-certificates` 后，Node 默认即可信任，不需要 `NODE_EXTRA_CA_CERTS`。
 
-实测复现（macOS，CA 已在钥匙串受信任）：
+**关键结论：**
+
+- **macOS**：系统信任与 Node 信任是**两件事**，必须额外给 Node 传 CA（§2.3）；
+- **Linux**：只要装进系统 CA 存储，**浏览器和 Node 一并生效**，最省事；
+- 两边都不要假设对方的行为——先按 §0.4 的探查确认。
+
+### 2.2 实测对照
+
+**macOS**（CA 已在钥匙串受信任，Node 仍失败）：
 
 ```bash
-# 浏览器/curl 能通
-curl -s -o /dev/null -w "%{http_code}\n" https://<地址>:<端口>/auth/login   # → 200
+curl -s -o /dev/null -w "%{http_code}\n" https://<地址>:<端口>/auth/login   # → 200（浏览器信任链 OK）
+env -u NODE_EXTRA_CA_CERTS node -e "..."                                    # → SELF_SIGNED_CERT_IN_CHAIN
+node --use-system-ca -e "..."                                              # → 仍然失败
+```
+
+> 实测：在 macOS 上 `--use-system-ca`（Node 提供的「改用系统 CA」开关）**也解决不了**——
+> 它不会让 Node 读取钥匙串中**用户手动信任**的 CA。macOS 只能用 §2.3 的方案。
+
+**Linux**（装进系统 CA 存储，Node 直接可用）：
+
+```bash
+sudo cp ca.crt /usr/local/share/ca-certificates/dsh-local-ca.crt
+sudo update-ca-certificates
+
+# 不需要 NODE_EXTRA_CA_CERTS
+node -e "require('node:https').get('https://<地址>:<端口>/auth/login', r => console.log(r.statusCode))"  # → 200
+```
 
 # Node 仍失败
 node -e "require('node:https').get('https://<地址>:<端口>/auth/login',r=>{console.log(r.statusCode);process.exit()}).on('error',e=>{console.log(e.code);process.exit()})"
 # → SELF_SIGNED_CERT_IN_CHAIN
 ```
 
-### 2.2 解法
+### 2.3 解法
 
 按「影响范围」从大到小排列，任选其一：
 
-**方案 A：`NODE_EXTRA_CA_CERTS`（推荐，最通用）**
+> **Linux 用户注意**：如果你的 CA 已经通过 `update-ca-certificates` 装进系统存储，**通常不需要
+> 本节任何方案**——Node 会直接读取。先用下面的 `node -e` 验证一下，能通过就跳过。
+> `NODE_EXTRA_CA_CERTS` 主要是给 **macOS** 用的，以及用于跨平台统一。
+
+**方案 A：`NODE_EXTRA_CA_CERTS`（最通用，macOS 必备）**
 
 ```bash
 export NODE_EXTRA_CA_CERTS=/path/to/ca-cert.pem
 ```
 
-- **跨平台**：macOS / Linux 行为一致；
+- **跨平台**：macOS / Linux 行为一致（Linux 上属于锦上添花）；
 - **只影响 Node**：不改变浏览器与系统信任；
 - ⚠️ **只在进程启动时读取**：已经跑起来的进程不会生效，必须重启。
 
@@ -330,21 +363,24 @@ NODE_TLS_REJECT_UNAUTHORIZED=0 node ...
 > 为什么单独点名：很多排障帖会建议这个开关。它会让**所有** TLS 校验失效（包括 DSH 访问
 > 外部 API 的连接），把证书问题变成静默的安全洞。用它定位完就必须撤掉。
 
-### 2.3 各场景该用哪种
+### 2.4 各场景该用哪种
 
-| 场景 | 建议 |
-|---|---|
-| 让 **DSH 进程**信任自签证书 | 启动前 `export NODE_EXTRA_CA_CERTS=...`，或写进 systemd/launchd 的 service 环境 |
-| 跑 `test/live-*.mjs` 等仓库脚本 | 同上；`test/tls-mux-scheme.run.mjs` 已经这么做了（用 launcher 注入） |
-| 只是浏览器访问面板 | 不需要动 Node —— 浏览器走自己的信任链（§1） |
-| Linux 上想让系统级也信任（非 Node 程序） | `sudo cp ca.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates`（注意：**对 Node 仍无效**，Node 还需要方案 A） |
+| 场景 | macOS | Linux |
+|---|---|---|
+| 让 **DSH 进程**信任自签证书 | `export NODE_EXTRA_CA_CERTS=...`（或写进 launchd 的 service 环境） | **装进系统 CA 即可**：`update-ca-certificates`，无需环境变量 |
+| 跑 `test/live-*.mjs` 等仓库脚本 | 同上（`test/tls-mux-scheme.run.mjs` 已用 launcher 注入） | 同上，装系统 CA 后直接可用 |
+| 只是浏览器访问面板 | 动浏览器信任链（§1），不需要动 Node | 同 macOS |
+| 需要**跨平台统一**的做法 | `NODE_EXTRA_CA_CERTS` 两端都有效 | 同左 |
 
-### 2.4 常见误区
+> **建议**：如果不确定目标机器是哪种情况，用 `NODE_EXTRA_CA_CERTS`——它在 macOS 和 Linux
+> 上行为一致。Linux 上额外做系统 CA 安装可以让 DSH 之外的工具也一并信任。
+
+### 2.5 常见误区
 
 | 做法 | 为什么不够 |
 |---|---|
-| 只做了 `security add-trusted-cert`（macOS） | 只修好浏览器；Node 仍不信任 |
-| 只做了 `update-ca-certificates`（Linux） | 同上，Node 不读该目录 |
+| 只做了 `security add-trusted-cert`（macOS） | 只修好浏览器；**Node 仍不信任**——macOS 上必须额外处理（§2.3） |
+| 以为 Linux 上也一样要设 `NODE_EXTRA_CA_CERTS` | Linux 会读系统 CA，装好后本就可用；多设一个变量不会错，但别以为系统 CA 白装了 |
 | 用 `curl -k` 验证通过 | `-k` 是**跳过**校验，不能证明任何信任关系成立 |
 | 设了 `NODE_EXTRA_CA_CERTS` 但没重启进程 | 该变量只在启动时读取 |
 
@@ -421,8 +457,8 @@ WebAuthn 调用——等于为了本机使用，额外引入了一整套证书�
 | 症状 | 最可能原因 |
 |---|---|
 | 浏览器报 `NET::ERR_CERT_AUTHORITY_INVALID` | CA 未导入受信任根，或导入的是叶子证书而非 CA |
-| 浏览器正常，但 **Node 脚本报 `SELF_SIGNED_CERT_IN_CHAIN`** | **浏览器与 Node 是两套信任链**：macOS 与 Linux 上 Node 都不读系统 CA（见 §2） |
-| 设了 `NODE_EXTRA_CA_CERTS` 却没效果 | 该变量只在**进程启动时**读取，必须重启进程（见 §2.2） |
+| 浏览器正常，但 **Node 脚本报 `SELF_SIGNED_CERT_IN_CHAIN`** | **浏览器与 Node 是两套信任链**。macOS 上 Node 不读钥匙串，必须额外配（§2.3）；Linux 装好系统 CA 通常就够 |
+| 设了 `NODE_EXTRA_CA_CERTS` 却没效果 | 该变量只在**进程启动时**读取，必须重启进程（见 §2.3） |
 | `find-certificate` 能找到 CA，但浏览器仍报警 | 证书「存在」≠「被信任」，信任设置未生效（见 §1 的 `curl` 判据） |
 | `curl` 返回 `000` / 退出码 7 | **连不上**，不是证书问题——多半是地址/端口不对或实例未监听该地址 |
 | 浏览器正常，但其他设备报证书错误 | 只在当前机器信任了 CA（见 §1） |
