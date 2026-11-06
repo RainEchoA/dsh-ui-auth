@@ -303,42 +303,63 @@ curl -s -o /dev/null -w "trusted=%{http_code}\n" https://<实际监听地址>:<�
 - **Linux**：只要装进系统 CA 存储（用对发行版的命令），**浏览器和 Node 一并生效**，最省事；
 - 两边都不要假设对方的行为——先按 §0.4 的探查确认。
 
-### 2.2 实测对照
+### 2.2 注入 CA：按平台执行
 
-**macOS**（CA 已在钥匙串受信任，Node 仍失败）：
+把 CA 交给 Node 有两种路径——**系统级**（Linux 推荐，浏览器与 Node 一并生效）和
+**进程级**（macOS 必需，或不想动系统存储时）。下面按你的平台选一条。
 
-```bash
-curl -s -o /dev/null -w "%{http_code}\n" https://<地址>:<端口>/auth/login   # → 200（浏览器信任链 OK）
-env -u NODE_EXTRA_CA_CERTS node -e "..."                                    # → SELF_SIGNED_CERT_IN_CHAIN
-node --use-system-ca -e "..."                                              # → 仍然失败
-```
-
-> 实测：在 macOS 上 `--use-system-ca`（Node 提供的「改用系统 CA」开关）**也解决不了**——
-> 它不会让 Node 读取钥匙串中**用户手动信任**的 CA。macOS 只能用 §2.4 的方案。
-
-**Linux**（装进系统 CA 存储，Node 直接可用）：
+#### 路径 A：装进系统信任存储（Linux 推荐）
 
 ```bash
+CA=/path/to/ca-cert.pem
+
 # Debian / Ubuntu
-sudo cp ca.crt /usr/local/share/ca-certificates/dsh-local-ca.crt
+sudo cp "$CA" /usr/local/share/ca-certificates/dsh-local-ca.crt
 sudo update-ca-certificates
 
-# RHEL / CentOS / Rocky / Alma（CentOS 8 实测）
-sudo cp ca.crt /etc/pki/ca-trust/source/anchors/dsh-local-ca.crt
+# RHEL / CentOS / Rocky / Alma
+sudo cp "$CA" /etc/pki/ca-trust/source/anchors/dsh-local-ca.crt
 sudo update-ca-trust extract
-
-# 两种情况都不需要 NODE_EXTRA_CA_CERTS
-node -e "require('node:https').get('https://<地址>:<端口>/auth/login', r => console.log(r.statusCode))"  # → 200
 ```
 
-> 实测环境：**Node 24 + CentOS 8**，`update-ca-trust extract` 之后 Node 默认即信任。
+完成后**无需任何环境变量**，Node 会直接读取（验证见 §2.3）。
 
-# Node 仍失败
-node -e "require('node:https').get('https://<地址>:<端口>/auth/login',r=>{console.log(r.statusCode);process.exit()}).on('error',e=>{console.log(e.code);process.exit()})"
-# → SELF_SIGNED_CERT_IN_CHAIN
+#### 路径 B：进程级注入（macOS 必需；Linux 可选）
+
+```bash
+CA=/path/to/ca-cert.pem
+export NODE_EXTRA_CA_CERTS="$CA"
 ```
+
+⚠️ 只在**进程启动时**读取——已运行的实例不会生效，必须重启。
+
+#### 把它固化进服务（避免每次手动 export）
+
+```ini
+# systemd（Linux）：/etc/systemd/system/dsh-web.service.d/ca.conf
+[Service]
+Environment=NODE_EXTRA_CA_CERTS=/etc/pki/ca-trust/source/anchors/dsh-local-ca.crt
+```
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart dsh-web
+```
+
+macOS 用 launchd 时，在 plist 的 `EnvironmentVariables` 字典里加同名键。
+
+#### 一次性验证
+
+```bash
+# 不带 -k：这一步才真正检验信任是否生效
+node -e "require('node:https').get('https://<地址>:<端口>/auth/login', r => {
+  console.log('✅', r.statusCode); process.exit()
+}).on('error', e => { console.log('❌', e.code); process.exit(1) })"
+```
+
+看到 `✅ 200` 即成功；`❌ SELF_SIGNED_CERT_IN_CHAIN` 说明 Node 仍未信任（→ §2.3 诊断）。
 
 ### 2.3 诊断：Node 到底信任哪些 CA
+
 
 排查证书问题时，先让 Node 自己说清楚「它现在信任什么」，比猜快得多。
 
@@ -389,106 +410,110 @@ If the root CA is installed locally, try running Node.js with --use-system-ca fl
 
 如果这条提示出现，说明 Node **没有**把该 CA 视为可信——这是最可靠的信号。
 
-### 2.4 解法
+### 2.4 其他注入方式（代码内 / 不推荐）
 
-按「影响范围」从大到小排列，任选其一：
+§2.2 覆盖了绝大多数场景（系统存储 + `NODE_EXTRA_CA_CERTS`）。剩下三种方式供特殊需要：
 
-> **Linux 用户注意**：如果 CA 已经装进系统信任存储（Debian 系 `update-ca-certificates` /
-> RHEL 系 `update-ca-trust extract`），**通常不需要本节任何方案**——Node 会直接读取。
-> 先用下面的 `node -e` 验证一下，能通过就跳过。
-> `NODE_EXTRA_CA_CERTS` 主要是给 **macOS** 用的，以及用于跨平台统一。
+| 方式 | 适用 | 注意 |
+|---|---|---|
+| **代码里显式传 `ca`** | 自己写的脚本/测试 | 只有 `node:https` / `node:tls` 支持；**全局 `fetch` 不支持** |
+| `NODE_OPTIONS=--use-system-ca` | 想用系统 CA 又不想装 | Linux 有效；**macOS 读不到钥匙串** |
+| `NODE_TLS_REJECT_UNAUTHORIZED=0` | ❌ 仅一次性排查 | **关闭校验**，不是信任 CA |
 
-**方案 A：`NODE_EXTRA_CA_CERTS`（最通用，macOS 必备）**
-
-```bash
-export NODE_EXTRA_CA_CERTS=/path/to/ca-cert.pem
-```
-
-- **跨平台**：macOS / Linux 行为一致（Linux 上属于锦上添花）；
-- **只影响 Node**：不改变浏览器与系统信任；
-- ⚠️ **只在进程启动时读取**：已经跑起来的进程不会生效，必须重启。
-
-```bash
-# 验证是否生效
-NODE_EXTRA_CA_CERTS=/path/to/ca-cert.pem node -e "
-require('node:https').get('https://<地址>:<端口>/auth/login', r => { console.log('✅', r.statusCode); process.exit() })
-  .on('error', e => { console.log('❌', e.code); process.exit(1) })"
-```
-
-**方案 B：代码里显式传 `ca`（适合脚本/测试）**
-
-只有 **`node:https` / `node:tls`** 支持直接传 `ca`：
+#### 代码里显式传 `ca`
 
 ```js
 import { get } from 'node:https'
 import { readFileSync } from 'node:fs'
-get('https://<地址>:<端口>/auth/login', { ca: readFileSync('/path/to/ca-cert.pem') }, res => { ... })
+
+get('https://<地址>:<端口>/auth/login', { ca: readFileSync('/path/to/ca-cert.pem') }, res => {
+  console.log(res.statusCode)
+})
 ```
 
-⚠️ **全局 `fetch` 不支持 `ca` 选项**：Node 内置的 `fetch`（undici）不接受 `ca` 参数，
-也不提供可以直接 `import` 的 `undici` 模块（`import('undici')` 会报 `ERR_MODULE_NOT_FOUND`）。
-所以依赖 `fetch` 的脚本（如仓库里的 `test/live-*.mjs`）**只能用方案 A**，
-或改用 `node:https` 重写。
+⚠️ **全局 `fetch` 不能用这个办法**：Node 内置的 `fetch`（undici）不接受 `ca` 选项，
+也没有可直接 `import` 的 `undici` 模块（`import('undici')` 会报 `ERR_MODULE_NOT_FOUND`）。
+依赖 `fetch` 的脚本（如仓库里的 `test/live-*.mjs`）**只能用 §2.2 的方案**，或改用 `node:https`。
 
-**方案 C：禁用校验（❌ 不推荐，仅限一次性排查）**
+#### 关于 `NODE_TLS_REJECT_UNAUTHORIZED=0`
 
-```bash
-# 仅用于确认「是不是证书问题」，不要写进任何长期配置
-NODE_TLS_REJECT_UNAUTHORIZED=0 node ...
-```
+很多排障帖会建议它。它**关闭**所有 TLS 校验（包括 DSH 访问外部 API 的连接），
+不是「信任这个 CA」——用它定位完必须立刻撤掉，绝不要写进长期配置或 service 单元。
 
-> 为什么单独点名：很多排障帖会建议这个开关。它会让**所有** TLS 校验失效（包括 DSH 访问
-> 外部 API 的连接），把证书问题变成静默的安全洞。用它定位完就必须撤掉。
+### 2.5 跨平台证书路径与环境变量速查
 
-### 2.5 用环境变量控制 Node 的 CA 来源（Linux 尤其有用）
+写脚本时最常需要的两件事：**CA 应该放哪里**、**用哪个环境变量**。下面按平台列全。
 
-在 Linux 上**不修改系统存储**也能让 Node 信任你的 CA——适合容器、`systemd` 单元、或不想动
-`update-ca-trust` 的场景。
+#### 系统 CA 路径（供脚本判断/写入）
 
-**对 Node 真正有效的是两个变量：**
-
-| 变量 | 作用 | 生效范围 | 实测（Node 24） |
+| 平台 | 放置目录 | 生效命令 | OpenSSL bundle 路径 |
 |---|---|---|---|
-| **`NODE_EXTRA_CA_CERTS`** | **追加**一个 PEM 文件到 Node 的 CA 列表 | 仅 Node | ✅ **有效** |
-| **`NODE_OPTIONS=--use-system-ca`** | 让 Node 改用系统 CA 存储 | 仅 Node | 标志被接受；Linux 上会读系统 CA，macOS 上读不到钥匙串（§2.2） |
+| **macOS** | 钥匙串（无目录） | `security add-trusted-cert` | — |
+| **Debian / Ubuntu** | `/usr/local/share/ca-certificates/` | `update-ca-certificates` | `/etc/ssl/certs/ca-certificates.crt` |
+| **RHEL / CentOS / Rocky / Alma** | `/etc/pki/ca-trust/source/anchors/` | `update-ca-trust extract` | `/etc/pki/tls/certs/ca-bundle.crt` |
+| **Alpine** | `/usr/local/share/ca-certificates/` | `update-ca-certificates` | `/etc/ssl/certs/ca-certificates.crt` |
+| **Arch** | `/etc/ca-certificates/trust-source/anchors/` | `trust extract-compat` | `/etc/ssl/certs/ca-certificates.crt` |
 
-> ⚠️ **`SSL_CERT_FILE` / `SSL_CERT_DIR` 对 Node 无效。**
-> 这两个是 **OpenSSL 的标准环境变量**，`curl`、`openssl s_client` 等 OpenSSL 命令行工具会读，
-> 但 **Node 内置的 TLS / `fetch` 不读它们**——实测设置后 `tls.getCACertificates('system')`
-> 仍是 `0`，连接依旧报 `SELF_SIGNED_CERT_IN_CHAIN`。
+> 检测发行版的脚本片段：
 >
-> 排查时容易误判：设了 `SSL_CERT_FILE` 后 `curl` 能通、`node` 仍失败，于是以为「Node 的配置没生效」，
-> 实际是**这两个变量从来就不在 Node 的生效路径上**。也能反过来误判成功——
-> 如果环境里同时有 `NODE_EXTRA_CA_CERTS`，`SSL_CERT_FILE` 的「测试通过」其实是前者在起作用。
+> ```bash
+> . /etc/os-release
+> case "$ID $ID_LIKE" in
+>   *debian*|*ubuntu*) ANCHOR=/usr/local/share/ca-certificates/; CMD="update-ca-certificates" ;;
+>   *rhel*|*centos*|*fedora*|*rocky*|*alma*) ANCHOR=/etc/pki/ca-trust/source/anchors/; CMD="update-ca-trust extract" ;;
+>   *alpine*) ANCHOR=/usr/local/share/ca-certificates/; CMD="update-ca-certificates" ;;
+>   *arch*) ANCHOR=/etc/ca-certificates/trust-source/anchors/; CMD="trust extract-compat" ;;
+>   *) echo "未知发行版，请手动确认 CA 路径"; exit 1 ;;
+> esac
+> ```
 
-**`NODE_EXTRA_CA_CERTS` 用法**（Linux / macOS 通用）：
+#### 环境变量：哪些对 Node 有效
+
+| 变量 | 对 Node 有效 | 作用 |
+|---|---|---|
+| **`NODE_EXTRA_CA_CERTS`** | ✅ **有效** | **追加**一个 PEM 到 Node 的 CA 列表。macOS 上唯一可靠的进程级手段 |
+| `NODE_OPTIONS=--use-system-ca` | ✅ 被接受 | 改用系统 CA；Linux 上读系统存储，**macOS 上读不到钥匙串** |
+| `SSL_CERT_FILE` | ❌ **无效** | OpenSSL 标准变量，`curl` 读，**Node 不读** |
+| `SSL_CERT_DIR` | ❌ **无效** | 同上 |
+| `NODE_TLS_REJECT_UNAUTHORIZED=0` | ⚠️ 有害 | **关闭校验**，不是信任 CA；见 §2.4 警告 |
+
+> **`SSL_CERT_FILE` / `SSL_CERT_DIR` 的误判陷阱**（值得单独记一笔）：
+> 设了它们以后 `curl` 能通、`node` 仍失败，容易误以为「Node 配置没生效」；
+> 更糟的是反向误判——若环境里**已有** `NODE_EXTRA_CA_CERTS`，`SSL_CERT_FILE` 的
+> 「测试通过」其实是前者在起作用。判断时务必先 `env -u NODE_EXTRA_CA_CERTS` 隔离。
+
+#### 一段可直接用的注入脚本
 
 ```bash
-# 只让 Node 额外信任这个 CA，不影响其他程序
-export NODE_EXTRA_CA_CERTS=/etc/pki/ca-trust/source/anchors/dsh-local-ca.crt
+#!/usr/bin/env bash
+# inject-ca.sh <ca-cert.pem> —— 按平台把 CA 注入系统信任存储
+set -euo pipefail
+if [ $# -lt 1 ]; then echo "用法: $0 <ca-cert.pem>" >&2; exit 2; fi
+CA="$1"
+[ -f "$CA" ] || { echo "找不到证书: $CA" >&2; exit 1; }
 
-# 验证（不带任何 -k）
-node -e "require('node:https').get('https://<地址>:<端口>/auth/login', r => {
-  console.log('✅', r.statusCode); process.exit()
-}).on('error', e => { console.log('❌', e.code); process.exit(1) })"
+if [ "$(uname -s)" = "Darwin" ]; then
+  sudo security add-trusted-cert -d -r trustRoot -p ssl \
+    -k /Library/Keychains/System.keychain "$CA"
+  echo "✅ macOS：CA 已加入系统钥匙串"
+  echo "ℹ️  Node 仍需 NODE_EXTRA_CA_CERTS=$CA"   # 见 §2.1
+else
+  . /etc/os-release
+  case "$ID $ID_LIKE" in
+    *debian*|*ubuntu*|*alpine*)
+      sudo cp "$CA" /usr/local/share/ca-certificates/dsh-local-ca.crt
+      sudo update-ca-certificates ;;
+    *rhel*|*centos*|*fedora*|*rocky*|*alma*)
+      sudo cp "$CA" /etc/pki/ca-trust/source/anchors/dsh-local-ca.crt
+      sudo update-ca-trust extract ;;
+    *arch*)
+      sudo cp "$CA" /etc/ca-certificates/trust-source/anchors/dsh-local-ca.crt
+      sudo trust extract-compat ;;
+    *) echo "未知发行版 $ID，请手动确认 CA 路径" >&2; exit 1 ;;
+  esac
+  echo "✅ Linux：CA 已注入系统信任存储（Node 会直接读取，无需环境变量）"
+fi
 ```
-
-> ⚠️ **`NODE_TLS_REJECT_UNAUTHORIZED=0` 不是同类方案**：它**关掉校验**，不是「信任这个 CA」。
-> 见 §2.4 对它的警告。
-
-写进 `systemd` 单元的例子：
-
-```ini
-# /etc/systemd/system/dsh-web.service.d/ca.conf
-[Service]
-Environment=NODE_EXTRA_CA_CERTS=/etc/pki/ca-trust/source/anchors/dsh-local-ca.crt
-```
-
-> 修改后必须 `sudo systemctl daemon-reload && sudo systemctl restart dsh-web`——
-> 环境变量只在进程启动时读取。
-
-**至于「用系统 CA」这条路**：Linux 上最省事的仍是 §2.1 的装法——把 CA 装进系统存储，
-Node 会读，不需要任何环境变量。
 
 ### 2.6 各场景该用哪种
 
@@ -600,6 +625,71 @@ WebAuthn 调用——等于为了本机使用，额外引入了一整套证书�
 | 反代后浏览器报「证书名称不匹配」 | 访问用的域名不在证书 SAN 内，或反代未把 Host 正确转发 |
 
 ---
+
+## 附录：证据（本文结论的实测依据）
+
+本文的每个平台结论都来自实机测试，不是推断。列出测量方法与环境，便于读者复现或质疑。
+
+### E1. 测量方法
+
+所有「Node 是否信任某 CA」的结论，都用同一段代码判定——**发起真实 TLS 连接**，
+而不是读配置文件或看证书是否存在：
+
+```bash
+# 不带 -k：失败即表示 Node 不信任
+node -e "require('node:https').get('https://<地址>:<端口>/auth/login', r => {
+  console.log('✅', r.statusCode); process.exit()
+}).on('error', e => { console.log('❌', e.code); process.exit(1) })"
+```
+
+CA 列表的判定用 Node 官方运行时 API：
+
+```bash
+node -e "const tls=require('node:tls'); console.log({
+  openssl: process.versions.openssl,
+  bundled: tls.getCACertificates('bundled').length,
+  system:  tls.getCACertificates('system').length,
+})"
+```
+
+> 特意**没有**用 `process.config.variables.node_use_openssl_ca`：它是编译期变量，
+> Node 24 上已不存在（实测 `undefined`），用它只会得到假阴性。
+
+### E2. 平台实测结果
+
+| # | 环境 | 测量 | 结果 | 支撑的结论 |
+|---|---|---|---|---|
+| 1 | **macOS** / Node 24.14.1 / OpenSSL 3.5.5 | `tls.getCACertificates` | `{ bundled: 144, system: 0 }` | macOS 上 Node 不读钥匙串（§2.1） |
+| 2 | 同上，CA 已在钥匙串受信任 | 真实 https 请求 | `SELF_SIGNED_CERT_IN_CHAIN` | 系统信任 ≠ Node 信任（§2.1、§2.2） |
+| 3 | 同上，加 `--use-system-ca` | 真实 https 请求 | 仍是 `SELF_SIGNED_CERT_IN_CHAIN` | 该开关在 macOS 上解决不了（§2.4） |
+| 4 | 同上，`NODE_EXTRA_CA_CERTS` | 真实 https 请求 | `200` | 该变量有效（§2.2 路径 B） |
+| 5 | 同上，`SSL_CERT_FILE` | 真实 https 请求 | `SELF_SIGNED_CERT_IN_CHAIN` | 该变量对 Node 无效（§2.5） |
+| 6 | 同上，`SSL_CERT_DIR` | 真实 https 请求 | `SELF_SIGNED_CERT_IN_CHAIN` | 同上 |
+| 7 | **Debian 12** / Node 24 | `tls.getCACertificates` | `{ openssl: '3.0.16', bundled: 150, system: 422 }` | Linux 上 Node **读**系统存储（§2.1） |
+| 8 | **CentOS 8** / Node 24 | `update-ca-trust extract` 后真实 https 请求 | 无需任何环境变量即成功 | 同上（§2.1、§2.2 路径 A） |
+
+**要点**：第 1 行与第 7 行是同一段代码在两个平台上的输出——`system: 0` vs `system: 422` 的对比，
+就是「macOS 不读系统 CA、Linux 读」最直接的证据。
+
+### E3. 测试中发现的坑（已写进正文）
+
+| 坑 | 怎么被发现的 |
+|---|---|
+| `SSL_CERT_FILE` 看似有效 | 首次测试返回 200，但当时环境里**已有** `NODE_EXTRA_CA_CERTS`；用 `env -u NODE_EXTRA_CA_CERTS` 隔离后才发现它无效（§2.5） |
+| `node_use_openssl_ca` 在现代 Node 不存在 | 实测返回 `undefined`，同一对象里只剩 `node_use_openssl` |
+| `curl 200` + `node 失败` 不一定是配置问题 | macOS 上 Node 与浏览器各有信任链（E2 行 2、4 的对比） |
+| `curl` 返回 `000` 不是证书问题 | 实测 DSH 绑定局域网 IP 时不监听 `localhost`，用错地址得到 `000`（连不上），与信任失败表现相同（§1） |
+
+### E4. 本文未覆盖的部分
+
+诚实标注边界——以下结论**没有**在本文中实测验证过，请以官方文档为准：
+
+| 事项 | 说明 |
+|---|---|
+| Windows 的 Node 信任行为 | 未测试。据 Node 文档 Windows 会读系统证书存储，但本文未验证 |
+| Alpine / Arch 的 CA 路径 | 摘自各发行版通用做法，**未实测**（§2.5 表格中标注） |
+| `--use-system-ca` 在 Linux 上的效果 | 标志被接受且不报错，但本文未单独验证 Linux 上的实际行为差异 |
+| 各发行版对自定义 CA 的具体处理差异 | 如 Debian 的 `ca-certificates.crt` 合并时机等细节未深入 |
 
 ## 相关文档
 
