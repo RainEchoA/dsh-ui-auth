@@ -119,8 +119,29 @@ jobs:
             node test/live-compat-matrix.mjs
           fi
 
-      # 结果表格已由脚本写进 job summary；这里把 JSON 也挂成 artifact，
-      # 便于回填 docs/DSH-0.2.0-COMPATIBILITY.md 时直接取用。
+      # TLS 直连端到端：起一个真实 DSH 实例并以 --tls-cert/--tls-key 监听，
+      # 经本插件的 mux 透明代理走完整 wss 升级，断言通道真的承载数据。
+      #
+      # 为什么单独一步而不是塞进矩阵：矩阵只验证「插件能在该版本启动并授权」，
+      # 而 TLS 回连写错时那 38 项**全绿**——服务端零日志，表现为「登录正常、会话列表为空」，
+      # 只有这条链路能抓。单元用例（test/tls-mux-scheme.test.mjs）已覆盖 scheme 选型，
+      # 这里补的是「真实实例上确实打通」。
+      #
+      # 需要 NODE_EXTRA_CA_CERTS 信任测试证书，而它只在进程启动时读取，故整个步骤在带该变量的
+      # 环境里跑；脚本自身用一次性 DSH_HOME + 独立端口，跑完自行清理。
+      - name: End-to-end TLS mux (real instance, wss)
+        run: |
+          set -euo pipefail
+          # 装一个一次性 DSH CLI（与矩阵同一版本策略：最新 rc）
+          cli_root="$RUNNER_TEMP/dsh-e2e-cli"
+          dsh_version=$(npm view @deepseek-ai/dsh dist-tags --json | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const t=JSON.parse(s);console.log(t.latest||t.next)})")
+          echo "::notice::TLS 端到端使用 DSH $dsh_version"
+          npm install --prefix "$cli_root" "@deepseek-ai/dsh@$dsh_version" --no-audit --no-fund
+          DSH_E2E_CLI="$cli_root/node_modules/.bin/dsh" \
+          DSH_E2E_PORT=3302 \
+            NODE_EXTRA_CA_CERTS="$GITHUB_WORKSPACE/test/tls-mux-scheme-cert.pem" \
+            node test/live-tls-mux-e2e.mjs
+
       - name: Upload the matrix result
         if: always()
         uses: actions/upload-artifact@v4
