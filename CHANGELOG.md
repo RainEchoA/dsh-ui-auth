@@ -18,8 +18,20 @@
    gzip 字节当明文解析。回归覆盖 `test/binary-passthrough.test.mjs`（15 例，红-绿可复现）。
 3. **CI**：新增兼容矩阵 workflow（PR / 每周 / 手动），只守护当前 DSH 版本线；`dsh-ui-auth` 的
    README 兼容性表不再列举 `0.1.x` 历史版本。
+4. **TLS 直连部署下 mux 代理回连写死 `ws://`**：DSH 以 `--tls-cert/--tls-key` 直接监听（README 安全说明
+   承认的「TLS 直连」形态）时，宿主端口只有 TLS，而 `proxyMuxUpgrade` 回连宿主**写死明文 `ws://`**，
+   握手阶段即被断开（服务端零日志：上游 `error` 只触发静默 shutdown），表现为登录正常、
+   左下角无限「重新连接中」、会话列表为空；同一部署切回明文 HTTP 监听即恢复。
+   登录页不受影响（`/auth/*` 是普通 HTTP 路由，不经 mux 代理），与该症状只出现在
+   「会话列表/重新连接中」的观察一致。
+   修复：回连 scheme 按**入站升级的 socket 加密状态**推导（`wss`/`ws`）；反代终结 TLS 的部署
+   入站 socket 仍是明文，自动保持 `ws://`，行为不变。
+   回归：`test/tls-mux-scheme.test.mjs`（真实 TLS/明文宿主 + 完整 WS 握手驱动 `proxyMuxUpgrade`；
+   修复前 TLS 分支红、明文分支绿，修复后双绿）。TLS 分支需要信任测试 CA，而
+   `NODE_EXTRA_CA_CERTS` 只在进程启动时读取，故由 `test/tls-mux-scheme.run.mjs` 注入并接进 `npm test`。
 
-## 0.7.1 之后、本段之前的改动（Issue #3 回归补齐 + `registerPolicy` seam 修复）
+### 此前的改动：Issue #3 回归补齐 + `registerPolicy` seam 修复
+
 
 0.7.1 发布后补的三件事（**均已提交在 `main`；所有者决定暂不发布下一版**，因此它们尚未进入任何发行版——
 npm `latest` 仍是 0.7.1，下表第 2 条的运行时代价请按"已修复但未生效"对待）：
@@ -42,7 +54,6 @@ npm `latest` 仍是 0.7.1，下表第 2 条的运行时代价请按"已修复但
 3. **文档**：`docs/DSH-0.2.0-COMPATIBILITY.md` 新增 §4.1，说明自带 HTTP 载体的第三方插件
    （非标准 `{method, payload}` 信封）现在如何被内置规则放行，并给出 `uiAuth.registerPolicy()` 的
    完整示例（五个 section）与两条必须注意的语义（规则命中即接管内置裁剪；`matches` 写窄以免歧义 fail-closed）。
-
 ## 0.7.1 — 修复 mux 跨用户泄漏（Issue #6）与两项实测缺陷
 
 **安全修复（重要：0.7.0 请尽快升级）**
