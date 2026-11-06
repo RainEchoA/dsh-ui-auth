@@ -75,11 +75,12 @@ dscacheutil -q host -a name <候选域名> 2>/dev/null | head -3
 
 | 章节 | 何时需要 |
 |---|---|
-| §1 信任 CA | 本机首次部署，或证书报 `ERR_CERT_AUTHORITY_INVALID` |
-| §2 `--renew` vs `--regen` | 仅换叶子证书 → `--renew`；避免无谓地让所有设备重新信任 |
-| §3 域名与 SAN | 要用通行密钥，且当前用 IP 访问 |
-| §4 RP ID 与端口 | 多个实例共用同一域名 |
-| §5 localhost | 只是本机自用——**这种情况下根本不需要自签证书** |
+| §1 信任 CA | 本机首次部署，或浏览器证书报 `ERR_CERT_AUTHORITY_INVALID` |
+| §2 **Node 信任证书** | `curl` 通了但 Node 脚本/DSH 报 `SELF_SIGNED_CERT_IN_CHAIN` —— 浏览器与 Node 是两套信任 |
+| §3 `--renew` vs `--regen` | 仅换叶子证书 → `--renew`；避免无谓地让所有设备重新信任 |
+| §4 域名与 SAN | 要用通行密钥，且当前用 IP 访问 |
+| §5 RP ID 与端口 | 多个实例共用同一域名 |
+| §6 localhost | 只是本机自用——**这种情况下根本不需要自签证书** |
 
 **第三步：验证（必须做，不能只看命令退出码）**
 
@@ -107,7 +108,7 @@ curl -s -o /dev/null -w "trusted=%{http_code}\n" https://<域名>:<端口>/auth/
 agent 完成后应明确告知使用者这些**只能由人完成**的剩余事项：
 
 - 用浏览器实际打开一次，确认无证书警告；
-- 若要通行密钥，在 `https://<域名>:<端口>` 下试绑一次（用 IP 访问时按钮会不可用，见 §3）；
+- 若要通行密钥，在 `https://<域名>:<端口>` 下试绑一次（用 IP 访问时按钮会不可用，见 §4）；
 - 其他设备按 §1 各自导入 CA。
 
 > **注意**：本文的 `dsh.example.com`、`192.168.1.20` 都是**占位值**，agent 必须替换成
@@ -157,7 +158,98 @@ curl -s -o /dev/null -w "trusted=%{http_code}\n" https://<实际监听地址>:<�
 
 内网长期使用，建议用内部 CA 统一签发，并把 CA 一次性下发到各设备。
 
-## 2. 换 CA 就要全量重新信任
+## 2. Node.js 不信任系统证书 —— macOS 与 Linux 的差异与解法
+
+**这是最容易卡住的一步。** 浏览器信任了证书，不等于**跑在 Node.js 里的程序**也信任——
+而 DSH 本身就是 Node 程序，插件测试脚本（`test/live-*.mjs`）也用 Node 的 `fetch`/`https`。
+
+### 2.1 差异从哪来
+
+| 平台 | Node.js 的信任来源 | 结果 |
+|---|---|---|
+| **macOS** | 使用 **Node 自带的一组根证书**，**不读系统钥匙串** | 即使你 `security add-trusted-cert` 信任了 CA，Node 仍报 `self-signed certificate in certificate chain` |
+| **Linux** | 同样使用 Node 自带根证书，**不读** `/etc/ssl/certs` | 即使 `update-ca-certificates` 装好了 CA，Node 仍不信任 |
+| 浏览器（Chrome / Safari） | macOS 读钥匙串；Linux 多数读 NSS/IPA 库 | 与 Node **不是同一套规则** |
+
+**关键结论：在 Node.js 里，「系统信任」和「Node 信任」是两件事。** 这条在 macOS 和 Linux 上
+**都成立**——两者都不自动继承系统 CA（Windows 上 Node 会读系统证书存储，是唯一例外）。
+
+实测复现（macOS，CA 已在钥匙串受信任）：
+
+```bash
+# 浏览器/curl 能通
+curl -s -o /dev/null -w "%{http_code}\n" https://<地址>:<端口>/auth/login   # → 200
+
+# Node 仍失败
+node -e "require('node:https').get('https://<地址>:<端口>/auth/login',r=>{console.log(r.statusCode);process.exit()}).on('error',e=>{console.log(e.code);process.exit()})"
+# → SELF_SIGNED_CERT_IN_CHAIN
+```
+
+### 2.2 解法
+
+按「影响范围」从大到小排列，任选其一：
+
+**方案 A：`NODE_EXTRA_CA_CERTS`（推荐，最通用）**
+
+```bash
+export NODE_EXTRA_CA_CERTS=/path/to/ca-cert.pem
+```
+
+- **跨平台**：macOS / Linux 行为一致；
+- **只影响 Node**：不改变浏览器与系统信任；
+- ⚠️ **只在进程启动时读取**：已经跑起来的进程不会生效，必须重启。
+
+```bash
+# 验证是否生效
+NODE_EXTRA_CA_CERTS=/path/to/ca-cert.pem node -e "
+require('node:https').get('https://<地址>:<端口>/auth/login', r => { console.log('✅', r.statusCode); process.exit() })
+  .on('error', e => { console.log('❌', e.code); process.exit(1) })"
+```
+
+**方案 B：代码里显式传 `ca`（适合脚本/测试）**
+
+只有 **`node:https` / `node:tls`** 支持直接传 `ca`：
+
+```js
+import { get } from 'node:https'
+import { readFileSync } from 'node:fs'
+get('https://<地址>:<端口>/auth/login', { ca: readFileSync('/path/to/ca-cert.pem') }, res => { ... })
+```
+
+⚠️ **全局 `fetch` 不支持 `ca` 选项**：Node 内置的 `fetch`（undici）不接受 `ca` 参数，
+也不提供可以直接 `import` 的 `undici` 模块（`import('undici')` 会报 `ERR_MODULE_NOT_FOUND`）。
+所以依赖 `fetch` 的脚本（如仓库里的 `test/live-*.mjs`）**只能用方案 A**，
+或改用 `node:https` 重写。
+
+**方案 C：禁用校验（❌ 不推荐，仅限一次性排查）**
+
+```bash
+# 仅用于确认「是不是证书问题」，不要写进任何长期配置
+NODE_TLS_REJECT_UNAUTHORIZED=0 node ...
+```
+
+> 为什么单独点名：很多排障帖会建议这个开关。它会让**所有** TLS 校验失效（包括 DSH 访问
+> 外部 API 的连接），把证书问题变成静默的安全洞。用它定位完就必须撤掉。
+
+### 2.3 各场景该用哪种
+
+| 场景 | 建议 |
+|---|---|
+| 让 **DSH 进程**信任自签证书 | 启动前 `export NODE_EXTRA_CA_CERTS=...`，或写进 systemd/launchd 的 service 环境 |
+| 跑 `test/live-*.mjs` 等仓库脚本 | 同上；`test/tls-mux-scheme.run.mjs` 已经这么做了（用 launcher 注入） |
+| 只是浏览器访问面板 | 不需要动 Node —— 浏览器走自己的信任链（§1） |
+| Linux 上想让系统级也信任（非 Node 程序） | `sudo cp ca.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates`（注意：**对 Node 仍无效**，Node 还需要方案 A） |
+
+### 2.4 常见误区
+
+| 做法 | 为什么不够 |
+|---|---|
+| 只做了 `security add-trusted-cert`（macOS） | 只修好浏览器；Node 仍不信任 |
+| 只做了 `update-ca-certificates`（Linux） | 同上，Node 不读该目录 |
+| 用 `curl -k` 验证通过 | `-k` 是**跳过**校验，不能证明任何信任关系成立 |
+| 设了 `NODE_EXTRA_CA_CERTS` 但没重启进程 | 该变量只在启动时读取 |
+
+## 3. 换 CA 就要全量重新信任
 
 文档里的签发脚本提供两个相近但差别很大的参数：
 
@@ -169,7 +261,7 @@ curl -s -o /dev/null -w "trusted=%{http_code}\n" https://<实际监听地址>:<�
 正在排查证书错误时尤其容易选错：症状看起来一样（浏览器报证书无效），但 `--regen`
 会让问题扩散到所有设备。
 
-## 3. IP 地址不能做通行密钥的 RP ID —— 与证书是否受信任无关
+## 4. IP 地址不能做通行密钥的 RP ID —— 与证书是否受信任无关
 
 这是 **WebAuthn 规范**的限制，自签证书再受信任也救不了：
 
@@ -195,7 +287,7 @@ openssl x509 -in certs/server-chain.pem -noout -text | grep -A2 "Subject Alterna
 
 只用 IP 访问时，**密码 + TOTP 仍完全正常**，只是通行密钥不可用。
 
-## 4. RP ID 忽略端口：同域名不同端口共享通行密钥
+## 5. RP ID 忽略端口：同域名不同端口共享通行密钥
 
 通行密钥的 RP ID **不包含端口**。`https://dsh.example.com:3443` 与
 `https://dsh.example.com:8443` 被视为**同一个 relying party**，在其一绑定的通行密钥
@@ -204,7 +296,7 @@ openssl x509 -in certs/server-chain.pem -noout -text | grep -A2 "Subject Alterna
 多实例共用一个域名/证书时请留意。需要固定时用 `DSH_AUTH_RP_ID` 显式指定
 （见 [运维手册](OPERATIONS.md) 的环境变量表；值必须是访问域名的后缀）。
 
-## 5. `http://localhost` 本身就是安全上下文
+## 6. `http://localhost` 本身就是安全上下文
 
 如果只是**本机自用**，最省事的做法是走明文 `http://localhost:3080`——
 loopback 源（`localhost` / `127.0.0.1` / `::1`）在浏览器里属于可信源，**无需任何证书**
@@ -215,7 +307,7 @@ WebAuthn 调用——等于为了本机使用，额外引入了一整套证书�
 
 **建议**：本机用 `http://localhost`；自签证书留给「需要局域网其他设备访问」的场景。
 
-## 6. TLS 直连下 mux 通道的状态
+## 7. TLS 直连下 mux 通道的状态
 
 | 插件版本 | TLS 直连（`--tls-cert`） | 说明 |
 |---|---|---|
@@ -225,18 +317,20 @@ WebAuthn 调用——等于为了本机使用，额外引入了一整套证书�
 排查提示：这个症状**只影响会话列表/mux 连接**，登录页与 `/auth/*` 不受影响。
 如果「能登录但看不到会话」，先确认是不是这条；同一部署切回明文 HTTP 监听即恢复。
 
-## 7. 常见排查清单
+## 8. 常见排查清单
 
 | 症状 | 最可能原因 |
 |---|---|
 | 浏览器报 `NET::ERR_CERT_AUTHORITY_INVALID` | CA 未导入受信任根，或导入的是叶子证书而非 CA |
+| 浏览器正常，但 **Node 脚本报 `SELF_SIGNED_CERT_IN_CHAIN`** | **浏览器与 Node 是两套信任链**：macOS 与 Linux 上 Node 都不读系统 CA（见 §2） |
+| 设了 `NODE_EXTRA_CA_CERTS` 却没效果 | 该变量只在**进程启动时**读取，必须重启进程（见 §2.2） |
 | `find-certificate` 能找到 CA，但浏览器仍报警 | 证书「存在」≠「被信任」，信任设置未生效（见 §1 的 `curl` 判据） |
 | `curl` 返回 `000` / 退出码 7 | **连不上**，不是证书问题——多半是地址/端口不对或实例未监听该地址 |
 | 浏览器正常，但其他设备报证书错误 | 只在当前机器信任了 CA（见 §1） |
-| 能登录，但一直「重新连接中」 | TLS 直连 + 插件版本 ≤ 0.7.1（见 §6） |
-| 登录页提示「不接受 IP 地址作为通行密钥域」 | 用 IP 访问，通行密钥需要域名（见 §3） |
-| 换了证书后所有设备都报错 | 用了 `--regen` 换了 CA（见 §2） |
-| 两个端口上的通行密钥互相串 | RP ID 忽略端口（见 §4） |
+| 能登录，但一直「重新连接中」 | TLS 直连 + 插件版本 ≤ 0.7.1（见 §7） |
+| 登录页提示「不接受 IP 地址作为通行密钥域」 | 用 IP 访问，通行密钥需要域名（见 §4） |
+| 换了证书后所有设备都报错 | 用了 `--regen` 换了 CA（见 §3） |
+| 两个端口上的通行密钥互相串 | RP ID 忽略端口（见 §5） |
 
 ---
 
